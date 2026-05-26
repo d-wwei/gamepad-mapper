@@ -12,7 +12,9 @@ Layer 2 (later): the same dispatch supports action: shell / claude for agent hoo
 import argparse
 import json
 import os
+import re
 import signal
+import shlex
 import subprocess
 import sys
 import time
@@ -22,6 +24,7 @@ BASE = Path(__file__).resolve().parent
 PROFILES_DIR = BASE / "profiles"
 LAYOUTS_DIR = BASE / "layouts"
 STATE_FILE = BASE / "state.json"
+OSASCRIPT = "/usr/bin/osascript"
 
 try:
     import yaml
@@ -133,11 +136,60 @@ def require_yaml():
                  ".venv/bin/python mapper.py ...")
 
 
+class MapperError(Exception):
+    """Base exception for user-fixable mapper configuration errors."""
+
+
+class ShortcutError(MapperError):
+    """Raised when a shortcut cannot be parsed safely."""
+
+
+class QuartzUnavailableError(ShortcutError):
+    """Raised when a valid shortcut needs Quartz but Quartz is unavailable."""
+
+
+class ProfileError(MapperError):
+    """Raised when a profile cannot be loaded or validated."""
+
+
+class LayoutError(MapperError):
+    """Raised when a layout cannot be loaded or validated."""
+
+
+class SdlMappingError(MapperError):
+    """Raised when an SDL mapping token is unsupported."""
+
+
+def _warn(message):
+    print(f"[mapper] 警告: {message}", file=sys.stderr)
+
+
+def _env_enabled(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _file_mtime(path):
+    return path.stat().st_mtime if path.exists() else 0
+
+
+def _load_yaml_file(path, label):
+    require_yaml()
+    if not path.exists():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except Exception as e:
+        raise ProfileError(f"{label} YAML 无法解析: {path}: {e}") from e
+    if not isinstance(data, dict):
+        raise ProfileError(f"{label} 顶层必须是 mapping: {path}")
+    return data
+
+
 # ---------------------------------------------------------------------------
 # AppleScript senders
 # ---------------------------------------------------------------------------
 def _osa(script):
-    subprocess.run(["osascript", "-e", script], check=False,
+    subprocess.run([OSASCRIPT, "-e", script], check=False,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -154,6 +206,43 @@ def _needs_quartz(parts):
     if len(low) == 1 and low[0] in _FORCE_QUARTZ_KEYS:
         return True
     return False
+
+
+def _is_modifier_token(token):
+    return token.lower() in MODIFIERS or token.lower() in MOD_KEYCODES
+
+
+def _is_key_token(token):
+    low = token.lower()
+    return low in KEYCODES or low in CHAR_KEYCODES or len(token) == 1
+
+
+def parse_shortcut(combo, quartz_available=True):
+    """Validate and classify a shortcut without silently dropping tokens."""
+    parts = [p.strip() for p in str(combo).split("+") if p.strip()]
+    if not parts:
+        raise ShortcutError("快捷键不能为空")
+
+    unknown = [p for p in parts if not _is_modifier_token(p) and not _is_key_token(p)]
+    if unknown:
+        raise ShortcutError(f"未知快捷键 token: {', '.join(unknown)}")
+
+    non_mods = [p for p in parts if not _is_modifier_token(p)]
+    pure_modifier = not non_mods
+    if len(non_mods) > 1:
+        raise ShortcutError(f"快捷键只能有一个主键: {combo}")
+    if pure_modifier and not all(p.lower() in MOD_KEYCODES for p in parts):
+        raise ShortcutError(f"纯修饰键只支持 Quartz 精确键码: {combo}")
+
+    requires_quartz = _needs_quartz(parts)
+    if requires_quartz and not quartz_available:
+        raise QuartzUnavailableError(f"需要 Quartz/pyobjc 才能发送: {combo}")
+
+    return {
+        "parts": parts,
+        "requires_quartz": requires_quartz,
+        "pure_modifier": pure_modifier,
+    }
 
 
 def send_keycombo_quartz(Q, combo):
@@ -197,10 +286,9 @@ def send_keycombo_quartz(Q, combo):
 
 def send_shortcut(combo, Q=None):
     """combo like 'cmd+shift+4', 'return', 'rctrl+l', 'rctrl' (pure modifier)."""
-    parts = [p.strip() for p in str(combo).split("+") if p.strip()]
-    if not parts:
-        return
-    if Q is not None and _needs_quartz(parts):
+    parsed = parse_shortcut(combo, quartz_available=Q is not None)
+    parts = parsed["parts"]
+    if parsed["requires_quartz"]:
         send_keycombo_quartz(Q, combo)
         return
     mods = [MODIFIERS[p.lower()] for p in parts[:-1] if p.lower() in MODIFIERS]
@@ -245,21 +333,153 @@ def mouse_click(Q, button="left"):
                       Q.CGEventCreateMouseEvent(None, ev, (x, y), b))
 
 
+def _validate_repeat(spec, where):
+    if "repeat" not in spec:
+        return
+    repeat = spec["repeat"]
+    if isinstance(repeat, bool):
+        return
+    if not isinstance(repeat, dict):
+        raise ProfileError(f"{where}: repeat 必须是 bool 或 mapping")
+    for key in ("delay", "interval"):
+        if key in repeat:
+            try:
+                value = float(repeat[key])
+            except (TypeError, ValueError) as e:
+                raise ProfileError(f"{where}: repeat.{key} 必须是数字") from e
+            if value <= 0:
+                raise ProfileError(f"{where}: repeat.{key} 必须大于 0")
+
+
+def _validate_shell_spec(spec, where):
+    argv = spec.get("argv")
+    cmd = spec.get("cmd")
+    if argv is None and cmd is None:
+        raise ProfileError(f"{where}: shell action 需要 argv 或 cmd")
+    if argv is not None:
+        if (not isinstance(argv, list) or not argv or
+                not all(isinstance(v, str) and v for v in argv)):
+            raise ProfileError(f"{where}: shell argv 必须是非空字符串列表")
+    if cmd is not None and (not isinstance(cmd, str) or not cmd.strip()):
+        raise ProfileError(f"{where}: shell cmd 必须是非空字符串")
+
+
+def validate_action(spec, profile_name="<profile>", button_name="<button>",
+                    quartz_available=True):
+    where = f"profile '{profile_name}' binding '{button_name}'"
+    if isinstance(spec, str):
+        parse_shortcut(spec, quartz_available=quartz_available)
+        return
+    if not isinstance(spec, dict):
+        raise ProfileError(f"{where}: binding 必须是字符串或 mapping")
+
+    action = spec.get("action", "shortcut")
+    if not isinstance(action, str):
+        raise ProfileError(f"{where}: action 必须是字符串")
+
+    if action == "shortcut":
+        parse_shortcut(spec.get("keys", ""), quartz_available=quartz_available)
+    elif action == "text":
+        if "value" not in spec:
+            raise ProfileError(f"{where}: text action 需要 value")
+    elif action == "shell":
+        _validate_shell_spec(spec, where)
+    elif action in ("profile_next", "profile_prev", "mouse_click",
+                    "mouse_rightclick", "none"):
+        pass
+    else:
+        raise ProfileError(f"{where}: 未知 action: {action}")
+
+    _validate_repeat(spec, where)
+
+
+def validate_profile(profile, profile_name, quartz_available=True):
+    if not isinstance(profile, dict):
+        raise ProfileError(f"profile '{profile_name}' 顶层必须是 mapping")
+    bindings = profile.get("bindings", {}) or {}
+    if not isinstance(bindings, dict):
+        raise ProfileError(f"profile '{profile_name}' 的 bindings 必须是 mapping")
+    cleaned = dict(profile)
+    cleaned_bindings = dict(bindings)
+    errors = []
+    warnings = []
+    for button, spec in bindings.items():
+        try:
+            validate_action(spec, profile_name, button, quartz_available)
+        except QuartzUnavailableError as e:
+            cleaned_bindings.pop(button, None)
+            warnings.append(f"profile '{profile_name}' binding '{button}' 已跳过: {e}")
+        except ProfileError as e:
+            errors.append(str(e))
+        except ShortcutError as e:
+            errors.append(f"profile '{profile_name}' binding '{button}': {e}")
+
+    sticks = profile.get("sticks", {}) or {}
+    if not isinstance(sticks, dict):
+        errors.append(f"profile '{profile_name}' 的 sticks 必须是 mapping")
+    else:
+        for stick_name, stick_spec in sticks.items():
+            if not isinstance(stick_spec, dict):
+                errors.append(f"profile '{profile_name}' stick '{stick_name}' 必须是 mapping")
+                continue
+            for key in ("speed", "deadzone", "threshold", "repeat"):
+                if key in stick_spec:
+                    try:
+                        float(stick_spec[key])
+                    except (TypeError, ValueError):
+                        errors.append(
+                            f"profile '{profile_name}' stick '{stick_name}.{key}' 必须是数字")
+
+    if errors:
+        raise ProfileError("; ".join(errors))
+    cleaned["bindings"] = cleaned_bindings
+    if warnings:
+        cleaned["_warnings"] = warnings
+    return cleaned
+
+
+def _shell_argv(spec):
+    if spec.get("argv") is not None:
+        return list(spec["argv"])
+    return shlex.split(spec.get("cmd", ""))
+
+
+def run_shell_action(spec, ctx):
+    if not ctx.get("allow_shell_actions", False):
+        _warn("shell action 已禁用；使用 --allow-shell-actions 或 "
+              "GAMEPAD_MAPPER_ALLOW_SHELL=1 显式启用")
+        return
+    try:
+        argv = _shell_argv(spec)
+        if not argv:
+            _warn("shell action argv/cmd 为空，已跳过")
+            return
+        subprocess.Popen(argv)
+    except (OSError, ValueError) as e:
+        _warn(f"shell action 启动失败: {e}")
+
+
 def run_action(spec, ctx):
     """spec is a str (shortcut) or dict {action: ...}."""
     if spec is None:
         return
     if isinstance(spec, str):
-        send_shortcut(spec, ctx.get("mouse"))
+        try:
+            send_shortcut(spec, ctx.get("mouse"))
+        except ShortcutError as e:
+            _warn(str(e))
         return
     if isinstance(spec, dict):
         action = spec.get("action", "shortcut")
         if action == "shortcut":
-            send_shortcut(spec.get("keys", ""), ctx.get("mouse"))
+            try:
+                send_shortcut(spec.get("keys", ""), ctx.get("mouse"))
+            except ShortcutError as e:
+                _warn(str(e))
         elif action == "text":
             type_text(spec.get("value", ""))
         elif action == "shell":
-            subprocess.Popen(spec.get("cmd", ""), shell=True)
+            run_shell_action(spec, ctx)
         elif action in ("profile_next", "profile_prev"):
             ctx["cycle"](action)
         elif action == "mouse_click":
@@ -279,8 +499,8 @@ def load_state():
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError) as e:
+            _warn(f"state.json 无法读取，使用 default: {e}")
     return {"active": "default"}
 
 
@@ -293,11 +513,42 @@ def profile_path(name):
 
 
 def load_profile(name):
-    require_yaml()
-    p = profile_path(name)
-    if not p.exists():
-        return {}
-    return yaml.safe_load(p.read_text()) or {}
+    return _load_yaml_file(profile_path(name), "profile")
+
+
+def load_profile_checked(name, quartz_available=True):
+    return validate_profile(load_profile(name), name, quartz_available)
+
+
+def reload_profile_into(name, bindings, sticks, mtimes, quartz_available=True,
+                        errors_seen=None, logger=print):
+    pf = profile_path(name)
+    state_mtime = _file_mtime(STATE_FILE)
+    profile_mtime = _file_mtime(pf)
+    try:
+        prof = load_profile_checked(name, quartz_available=quartz_available)
+    except ProfileError as e:
+        mtimes["state"] = state_mtime
+        mtimes["profile"] = profile_mtime
+        error_key = (str(pf), profile_mtime, str(e))
+        if errors_seen is None or errors_seen.get(str(pf)) != error_key:
+            if errors_seen is not None:
+                errors_seen[str(pf)] = error_key
+            logger(f"[mapper] profile '{name}' 未加载，继续使用上一份可用配置: {e}")
+        return False
+
+    bindings.clear()
+    bindings.update(prof.get("bindings", {}) or {})
+    sticks.clear()
+    sticks.update(prof.get("sticks", {}) or {})
+    mtimes["state"] = state_mtime
+    mtimes["profile"] = profile_mtime
+    if errors_seen is not None:
+        errors_seen.pop(str(pf), None)
+    for warning in prof.get("_warnings", []):
+        logger(f"[mapper] 警告: {warning}")
+    logger(f"[mapper] 已加载 profile '{name}' ({len(bindings)} 个绑定)")
+    return True
 
 
 def list_profiles():
@@ -309,7 +560,14 @@ def load_layout_for(device_name):
     require_yaml()
     generic = None
     for f in sorted(LAYOUTS_DIR.glob("*.yaml")):
-        data = yaml.safe_load(f.read_text()) or {}
+        try:
+            data = yaml.safe_load(f.read_text()) or {}
+        except Exception as e:
+            _warn(f"布局 YAML 无法解析，已跳过 {f}: {e}")
+            continue
+        if not isinstance(data, dict):
+            _warn(f"布局顶层必须是 mapping，已跳过 {f}")
+            continue
         match = data.get("device_match", "")
         if match and match.lower() in device_name.lower():
             return data
@@ -360,8 +618,8 @@ def cmd_probe(args):
     print(f"设备名     : {joy.get_name()}")
     try:
         print(f"GUID       : {joy.get_guid()}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"GUID       : 无法读取 ({e})")
     print(f"按键数     : {joy.get_numbuttons()}")
     print(f"摇杆轴数   : {joy.get_numaxes()}")
     print(f"方向键(hat): {joy.get_numhats()}")
@@ -455,6 +713,30 @@ def cmd_calibrate(args):
     print(f"\n已写入布局: {out}")
 
 
+def parse_sdl_mapping_token(raw):
+    """Parse a compact SDL GameController mapping token."""
+    if raw is None:
+        raise SdlMappingError("empty token")
+    token = str(raw).strip()
+    if not token:
+        raise SdlMappingError("empty token")
+
+    m = re.fullmatch(r"b(\d+)", token)
+    if m:
+        return {"kind": "button", "index": int(m.group(1))}
+
+    m = re.fullmatch(r"([+-]?)a(\d+)", token)
+    if m:
+        sign = -1 if m.group(1) == "-" else 1
+        return {"kind": "axis", "index": int(m.group(2)), "sign": sign}
+
+    m = re.fullmatch(r"h(\d+)\.(\d+)", token)
+    if m:
+        return {"kind": "hat", "index": int(m.group(1)), "value": int(m.group(2))}
+
+    raise SdlMappingError(f"unsupported SDL mapping token: {token}")
+
+
 def cmd_automap(args):
     """Auto-generate a layout from SDL's GameController DB (no key presses)."""
     require_yaml()
@@ -482,31 +764,66 @@ def cmd_automap(args):
         "misc1": "Capture",
         "lefttrigger": "ZL", "righttrigger": "ZR",
     })
-    buttons, axis_buttons = {}, {}
+    buttons, axis_buttons, axis_button_dirs = {}, {}, {}
+    dpad_hat = None
+    warnings = []
     for sdl_name, target in sdl_to_name.items():
         raw = mapping.get(sdl_name)
         if not raw:
             continue
-        if raw.startswith("b"):
-            buttons[int(raw[1:])] = target
-        elif raw.startswith("a"):
-            axis_buttons[int(raw[1:])] = target
-    axes = {}
+        try:
+            token = parse_sdl_mapping_token(raw)
+        except SdlMappingError as e:
+            warnings.append(f"{sdl_name}={raw}: {e}")
+            continue
+        if token["kind"] == "button":
+            buttons[token["index"]] = target
+        elif token["kind"] == "axis":
+            axis_buttons[token["index"]] = target
+            if token["sign"] != 1:
+                axis_button_dirs[token["index"]] = token["sign"]
+        elif token["kind"] == "hat" and sdl_name.startswith("dp"):
+            if dpad_hat is None:
+                dpad_hat = token["index"]
+            elif dpad_hat != token["index"]:
+                warnings.append(f"{sdl_name}={raw}: 多个 hat index 暂不支持")
+        else:
+            warnings.append(f"{sdl_name}={raw}: 该目标暂不支持 hat 映射")
+
+    axes, axis_signs = {}, {}
     for sdl_axis in ("leftx", "lefty", "rightx", "righty"):
         raw = mapping.get(sdl_axis)
-        if raw and raw.startswith("a"):
-            axes[sdl_axis] = int(raw[1:])
+        if not raw:
+            continue
+        try:
+            token = parse_sdl_mapping_token(raw)
+        except SdlMappingError as e:
+            warnings.append(f"{sdl_axis}={raw}: {e}")
+            continue
+        if token["kind"] != "axis":
+            warnings.append(f"{sdl_axis}={raw}: 摇杆轴需要 axis token")
+            continue
+        axes[sdl_axis] = token["index"]
+        if token["sign"] != 1:
+            axis_signs[sdl_axis] = token["sign"]
+
     layout = {
         "device_match": name,
         "note": "auto-generated from SDL GameController DB (mapper.py automap)",
-        "dpad": "buttons",
+        "dpad": "hat" if dpad_hat is not None else "buttons",
         "buttons": dict(sorted(buttons.items())),
     }
+    if dpad_hat is not None:
+        layout["hat"] = dpad_hat
     if axis_buttons:
         layout["axis_buttons"] = dict(sorted(axis_buttons.items()))
         layout["axis_threshold"] = 0.5
+    if axis_button_dirs:
+        layout["axis_button_dirs"] = dict(sorted(axis_button_dirs.items()))
     if axes:
         layout["axes"] = axes
+    if axis_signs:
+        layout["axis_signs"] = axis_signs
     slug = "".join(ch if ch.isalnum() else "-" for ch in name.lower()).strip("-")
     out = LAYOUTS_DIR / f"{slug}.yaml"
     LAYOUTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -515,6 +832,8 @@ def cmd_automap(args):
     print(f"  设备     : {name}")
     print(f"  面键映射 : a/b/x/y 按手柄标签直通")
     print(f"  按钮 {len(buttons)} 个 / 扳机轴 {len(axis_buttons)} 个")
+    for warning in warnings:
+        print(f"  警告     : {warning}")
 
 
 def cmd_run(args):
@@ -526,18 +845,28 @@ def cmd_run(args):
         print(f"找不到匹配 '{name}' 的布局，请先运行: mapper.py calibrate")
         return
 
-    raw_buttons = layout.get("buttons", {}) or {}
-    # map: button index -> binding name
-    idx_to_name = {int(k): v for k, v in raw_buttons.items()}
-    dpad_mode = layout.get("dpad", "hat")
-    # analog triggers reported as axes (e.g. Switch ZL/ZR -> a4/a5)
-    axis_buttons = {int(k): v for k, v in (layout.get("axis_buttons") or {}).items()}
-    axis_threshold = float(layout.get("axis_threshold", 0.5))
-    # analog stick axis indices (leftx/lefty/rightx/righty -> axis number)
-    axes_map = {k: int(v) for k, v in (layout.get("axes") or {}).items()}
+    try:
+        raw_buttons = layout.get("buttons", {}) or {}
+        # map: button index -> binding name
+        idx_to_name = {int(k): v for k, v in raw_buttons.items()}
+        dpad_mode = layout.get("dpad", "hat")
+        dpad_hat = int(layout.get("hat", 0))
+        # analog triggers reported as axes (e.g. Switch ZL/ZR -> a4/a5)
+        axis_buttons = {int(k): v for k, v in (layout.get("axis_buttons") or {}).items()}
+        axis_button_dirs = {
+            int(k): int(v) for k, v in (layout.get("axis_button_dirs") or {}).items()
+        }
+        axis_threshold = float(layout.get("axis_threshold", 0.5))
+        # analog stick axis indices (leftx/lefty/rightx/righty -> axis number)
+        axes_map = {k: int(v) for k, v in (layout.get("axes") or {}).items()}
+        axis_signs = {k: int(v) for k, v in (layout.get("axis_signs") or {}).items()}
+    except (TypeError, ValueError) as e:
+        print(f"布局格式错误，请重新运行 automap/calibrate: {e}")
+        return
 
-    # Quartz powers stick->mouse and L3/R3 clicks; optional, so everything else
-    # still works if pyobjc is unavailable.
+    # Quartz powers stick->mouse, clicks, and exact keycodes. Bindings that need
+    # Quartz are skipped if pyobjc is unavailable; ordinary AppleScript
+    # shortcuts still work.
     try:
         import Quartz as _Q
     except ImportError:
@@ -547,18 +876,14 @@ def cmd_run(args):
     bindings = {}
     sticks = {}
     mtimes = {}
+    errors_seen = {}
 
     def reload_bindings():
-        prof = load_profile(state["active"])
-        bindings.clear()
-        bindings.update(prof.get("bindings", {}) or {})
-        sticks.clear()
-        sticks.update(prof.get("sticks", {}) or {})
-        mtimes["state"] = STATE_FILE.stat().st_mtime if STATE_FILE.exists() else 0
-        pf = profile_path(state["active"])
-        mtimes["profile"] = pf.stat().st_mtime if pf.exists() else 0
-        print(f"[mapper] 已加载 profile '{state['active']}' "
-              f"({len(bindings)} 个绑定)")
+        return reload_profile_into(
+            state["active"], bindings, sticks, mtimes,
+            quartz_available=_Q is not None,
+            errors_seen=errors_seen,
+        )
 
     def cycle(direction):
         profs = list_profiles()
@@ -570,7 +895,13 @@ def cmd_run(args):
         save_state({"active": state["active"]})
         reload_bindings()
 
-    ctx = {"cycle": cycle, "mouse": _Q}
+    ctx = {
+        "cycle": cycle,
+        "mouse": _Q,
+        "allow_shell_actions": (
+            args.allow_shell_actions or _env_enabled("GAMEPAD_MAPPER_ALLOW_SHELL")
+        ),
+    }
     reload_bindings()
     print(f"[mapper] 监听中: {name}. 改 profile 会自动热重载。Ctrl-C 退出。")
 
@@ -586,7 +917,8 @@ def cmd_run(args):
 
     def axval(name):
         idx = axes_map.get(name)
-        return joy.get_axis(idx) if idx is not None else 0.0
+        sign = axis_signs.get(name, 1)
+        return joy.get_axis(idx) * sign if idx is not None else 0.0
 
     # register AFTER pygame.init so this overrides SDL's own signal handlers
     stop = {"flag": False}
@@ -634,8 +966,8 @@ def cmd_run(args):
                 prev_btn[i] = cur
 
             # dpad via hat (rising edge per direction)
-            if dpad_mode == "hat" and joy.get_numhats() > 0:
-                hat = joy.get_hat(0)
+            if dpad_mode == "hat" and joy.get_numhats() > dpad_hat:
+                hat = joy.get_hat(dpad_hat)
                 if hat != prev_hat:
                     hx, hy = hat
                     if hy == 1 and prev_hat[1] != 1:
@@ -650,7 +982,8 @@ def cmd_run(args):
 
             # analog triggers as buttons (rising edge over threshold)
             for a, aname in axis_buttons.items():
-                pressed = joy.get_axis(a) > axis_threshold
+                direction = axis_button_dirs.get(a, 1)
+                pressed = joy.get_axis(a) * direction > axis_threshold
                 if pressed and not prev_axis[a]:
                     if aname in bindings:
                         run_action(bindings[aname], ctx)
@@ -698,14 +1031,22 @@ def cmd_run(args):
 def cmd_list(args):
     active = load_state().get("active", "default")
     for p in list_profiles():
-        prof = load_profile(p)
+        try:
+            prof = load_profile_checked(p, quartz_available=True)
+            desc = prof.get("description", "")
+        except ProfileError as e:
+            desc = f"(invalid: {e})"
         mark = "*" if p == active else " "
-        print(f"{mark} {p:<12} {prof.get('description', '')}")
+        print(f"{mark} {p:<12} {desc}")
 
 
 def cmd_switch(args):
     if not profile_path(args.name).exists():
         sys.exit(f"profile 不存在: {args.name} (可用: {', '.join(list_profiles())})")
+    try:
+        load_profile_checked(args.name, quartz_available=True)
+    except ProfileError as e:
+        sys.exit(f"profile 无效，未切换: {args.name}: {e}")
     save_state({"active": args.name})
     print(f"已切换到 profile '{args.name}'（若 mapper 正在运行会自动生效）")
 
@@ -740,7 +1081,9 @@ def cmd_status(args):
 def main():
     parser = argparse.ArgumentParser(prog="mapper.py", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("run", help="启动监听（常驻）")
+    run = sub.add_parser("run", help="启动监听（常驻）")
+    run.add_argument("--allow-shell-actions", action="store_true",
+                     help="允许 profile 执行 shell action（默认禁用）")
     sub.add_parser("list", help="列出所有 profile")
     sw = sub.add_parser("switch", help="切换 profile")
     sw.add_argument("name")

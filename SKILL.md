@@ -32,6 +32,7 @@ description: >
 | 命令 | 作用 |
 |---|---|
 | `./gamepad-mapper run` | 启动常驻监听（前台）。改 profile 会热重载 |
+| `./gamepad-mapper run --allow-shell-actions` | 显式允许 profile 里的 `action: shell` |
 | `./gamepad-mapper list` | 列出所有 profile，`*` 标记当前激活 |
 | `./gamepad-mapper switch <name>` | 切换激活 profile |
 | `./gamepad-mapper reset` | 恢复出厂：重写 `default.yaml` 为工厂默认并激活它 |
@@ -76,7 +77,8 @@ bindings:
    - `{action: none}` — 该键不绑定
    - `{action: profile_next}` / `{action: profile_prev}` — 用手柄键在 profile 间循环切换
    - `{action: mouse_click}` / `{action: mouse_rightclick}` — 鼠标左键 / 右键单击（需辅助功能授权）
-   - `{action: shell, cmd: "..."}` — 运行 shell 命令（**Layer 2 / agent 钩子**，见末尾）
+   - `{action: shell, argv: ["cmd", "arg"]}` — 运行本地命令；默认禁用，需 `--allow-shell-actions` 或 `GAMEPAD_MAPPER_ALLOW_SHELL=1`
+   - `{action: shell, cmd: "..."}` — 兼容旧写法，会按 shell 引号规则拆成 argv，但不会通过 shell 执行；同样默认禁用
 
 ## 摇杆配置 (sticks)
 
@@ -112,15 +114,21 @@ sticks:
 - **权限**：发按键、鼠标点击需在 *系统设置 → 隐私与安全性 → 辅助功能* 给运行它的终端 App 授权；读手柄若被拦，再到 *输入监控* 授权。**左摇杆控鼠标移动(warp)是例外，无需授权**。
 - **停止**：`run` 是前台常驻，按 Ctrl-C 即可干净退出（已处理 SDL 信号拦截问题）。
 - **出厂默认不可丢**：工厂默认硬编码在 `mapper.py` 的 `FACTORY_DEFAULT`，`reset` 永远能恢复到可用状态。
-- **热重载**：`run` 每 0.5s 检查激活 profile 与 `state.json`，改动自动重载。
+- **热重载**：`run` 每 0.5s 检查激活 profile 与 `state.json`，改动自动重载；如果 YAML 或快捷键配置有错，会继续使用上一份可用配置。
+- **校验**：未知快捷键 token 会被拒绝，不会降级成普通按键。
 
 ## Layer 2：与 agent 工作流结合（预留）
 
-`{action: shell, cmd: "..."}` 可让手柄键触发任意命令，包括 headless 调用 Claude：
+`{action: shell, argv: [...]}` 可让手柄键触发本地命令，包括 headless 调用 Claude。该能力默认关闭，启动时必须显式允许：
+
+```sh
+./gamepad-mapper run --allow-shell-actions
+```
+
 ```yaml
 bindings:
   ZR:
     action: shell
-    cmd: 'cd ~/myrepo && claude -p "review 我的 git diff" >> /tmp/agent.log 2>&1'
+    argv: ["claude", "-p", "review 我的 git diff"]
 ```
-当前出厂 profile 不含 shell 动作（安全）；需要时再加。
+当前出厂 profile 不含 shell 动作；需要时再加，并优先使用 `argv`。
