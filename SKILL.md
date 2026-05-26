@@ -15,7 +15,7 @@ description: >
 ## 工具位置
 
 ```
-/Users/eli/AI-Vault/scripts/gamepad-mapper/
+~/AI-Vault/scripts/gamepad-mapper/
 ├── mapper.py            # 主程序
 ├── gamepad-mapper       # wrapper：等价于 .venv/bin/python mapper.py
 ├── layouts/*.yaml       # 「按键编号→名称」布局，按手柄区分（automap/calibrate 生成）
@@ -25,7 +25,7 @@ description: >
 ```
 
 所有命令都在该目录下用 wrapper 运行，例如：
-`cd /Users/eli/AI-Vault/scripts/gamepad-mapper && ./gamepad-mapper status`
+`cd ~/AI-Vault/scripts/gamepad-mapper && ./gamepad-mapper status`
 
 ## CLI 速查
 
