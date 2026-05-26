@@ -1,0 +1,35 @@
+name: codex+typeless
+description: codex + typeless 场景（含摇杆控鼠标）
+bindings:
+  A: return
+  B: escape
+  Y:                       # 退格，长按连续删除
+    keys: backspace
+    repeat: true
+  R: cmd+space           # Spotlight
+  L: cmd+tab             # 切 App
+  ZR: ctrl+right         # 右切屏幕（需系统启用「移到右边一个空间」⌃→）
+  ZL: ctrl+left          # 左切屏幕（需系统启用「移到左边一个空间」⌃←）
+  Home: f11              # 显示桌面（依赖系统「显示桌面」快捷键设置）
+  Capture: cmd+shift+5   # 截图工具栏
+  dpad_up: shift+cmd+[
+  dpad_down: shift+cmd+]
+  dpad_right: ctrl+tab
+  dpad_left: ctrl+shift+tab
+  L3:
+    action: mouse_click        # 按下左摇杆 = 鼠标左键（需辅助功能授权）
+  R3:
+    action: mouse_rightclick   # 按下右摇杆 = 鼠标右键（需辅助功能授权）
+  # 右修饰键 / 纯修饰键：用 Quartz 按精确键码发送（右Ctrl=62, 右Shift=60）
+  X: rctrl                 # 单独右 Ctrl
+  Plus: alt+cmd+n          # ⌥⌘N — codex 创建新会话
+  Minus: rctrl+rshift      # 右 Ctrl + 右 Shift
+sticks:
+  left:
+    mode: mouse            # 左摇杆控制鼠标移动（warp，无需授权）
+    speed: 900             # 像素/秒，可调
+    deadzone: 0.15
+  right:
+    mode: dpad             # 右摇杆按方向发 ↑↓←→
+    threshold: 0.6
+    repeat: 0.13           # 持续推时的连发间隔（秒）

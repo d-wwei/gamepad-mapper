@@ -1,0 +1,21 @@
+name: browsing
+description: 浏览器场景 (标签页/前进后退/缩放)
+bindings:
+  A: return
+  B: cmd+w
+  X: cmd+t
+  Y: cmd+shift+t
+  L: cmd+shift+[
+  R: cmd+shift+]
+  ZL: cmd+[
+  ZR: cmd+]
+  Minus: cmd+-
+  Plus: cmd+=
+  dpad_up: up
+  dpad_down: down
+  dpad_left: left
+  dpad_right: right
+  Home:
+    action: none
+  Capture:
+    action: none

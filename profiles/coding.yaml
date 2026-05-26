@@ -1,0 +1,21 @@
+name: coding
+description: 编码场景 (撤销/重做/保存/注释等)
+bindings:
+  A: return
+  B: escape
+  X: cmd+c
+  Y: cmd+v
+  L: cmd+z
+  R: cmd+shift+z
+  ZL: cmd+/
+  ZR: cmd+s
+  Minus: cmd+tab
+  Plus: cmd+space
+  dpad_up: up
+  dpad_down: down
+  dpad_left: left
+  dpad_right: right
+  Home:
+    action: none
+  Capture:
+    action: none

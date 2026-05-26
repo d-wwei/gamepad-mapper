@@ -1,0 +1,4 @@
+#!/bin/sh
+# Thin wrapper so you can run `./gamepad-mapper <cmd>` without activating the venv.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$DIR/.venv/bin/python" "$DIR/mapper.py" "$@"

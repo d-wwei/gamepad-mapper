@@ -1,0 +1,21 @@
+name: default
+description: 出厂默认映射 (factory default)
+bindings:
+  A: return
+  B: escape
+  X: cmd+c
+  Y: cmd+v
+  L: cmd+[
+  R: cmd+]
+  ZL: cmd+shift+[
+  ZR: cmd+shift+]
+  Minus: cmd+tab
+  Plus: cmd+space
+  dpad_up: up
+  dpad_down: down
+  dpad_left: left
+  dpad_right: right
+  Home:
+    action: none
+  Capture:
+    action: none

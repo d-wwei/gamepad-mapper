@@ -1,0 +1,29 @@
+device_match: Nintendo Switch Pro Controller
+note: auto-generated from SDL GameController DB (mapper.py automap)
+dpad: buttons
+buttons:
+  0: A
+  1: B
+  2: X
+  3: Y
+  4: Minus
+  5: Home
+  6: Plus
+  7: L3
+  8: R3
+  9: L
+  10: R
+  11: dpad_up
+  12: dpad_down
+  13: dpad_left
+  14: dpad_right
+  15: Capture
+axis_buttons:
+  4: ZL
+  5: ZR
+axis_threshold: 0.5
+axes:
+  leftx: 0
+  lefty: 1
+  rightx: 2
+  righty: 3
