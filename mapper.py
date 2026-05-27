@@ -333,6 +333,16 @@ def mouse_click(Q, button="left"):
                       Q.CGEventCreateMouseEvent(None, ev, (x, y), b))
 
 
+def mouse_scroll(Q, dx=0, dy=0):
+    """Scroll by pixel deltas. Positive dx scrolls right; positive dy scrolls up."""
+    dx, dy = int(round(dx)), int(round(dy))
+    if not dx and not dy:
+        return
+    ev = Q.CGEventCreateScrollWheelEvent(
+        None, Q.kCGScrollEventUnitPixel, 2, dy, dx)
+    Q.CGEventPost(Q.kCGHIDEventTap, ev)
+
+
 def _validate_repeat(spec, where):
     if "repeat" not in spec:
         return
@@ -349,6 +359,19 @@ def _validate_repeat(spec, where):
                 raise ProfileError(f"{where}: repeat.{key} 必须是数字") from e
             if value <= 0:
                 raise ProfileError(f"{where}: repeat.{key} 必须大于 0")
+
+
+def _validate_timing_mapping(spec, where, keys):
+    if not isinstance(spec, dict):
+        raise ProfileError(f"{where} 必须是 mapping")
+    for key in keys:
+        if key in spec:
+            try:
+                value = float(spec[key])
+            except (TypeError, ValueError) as e:
+                raise ProfileError(f"{where}.{key} 必须是数字") from e
+            if value <= 0:
+                raise ProfileError(f"{where}.{key} 必须大于 0")
 
 
 def _validate_shell_spec(spec, where):
@@ -430,6 +453,46 @@ def validate_profile(profile, profile_name, quartz_available=True):
                         errors.append(
                             f"profile '{profile_name}' stick '{stick_name}.{key}' 必须是数字")
 
+    dpad_modes = profile.get("dpad_modes", {}) or {}
+    if not isinstance(dpad_modes, dict):
+        errors.append(f"profile '{profile_name}' 的 dpad_modes 必须是 mapping")
+    else:
+        toggle = dpad_modes.get("toggle", ["L", "R"])
+        if (not isinstance(toggle, list) or len(toggle) != 2 or
+                not all(isinstance(v, str) and v for v in toggle)):
+            errors.append(f"profile '{profile_name}' 的 dpad_modes.toggle 必须是两个按键名")
+        if "repeat" in dpad_modes:
+            try:
+                _validate_timing_mapping(
+                    dpad_modes["repeat"],
+                    f"profile '{profile_name}' 的 dpad_modes.repeat",
+                    ("delay", "interval"),
+                )
+            except ProfileError as e:
+                errors.append(str(e))
+        for mode_name in ("default", "alternate"):
+            mode = dpad_modes.get(mode_name, {}) or {}
+            if not isinstance(mode, dict):
+                errors.append(f"profile '{profile_name}' 的 dpad_modes.{mode_name} 必须是 mapping")
+                continue
+            for button, spec in mode.items():
+                if button not in ("dpad_up", "dpad_down", "dpad_left", "dpad_right"):
+                    errors.append(
+                        f"profile '{profile_name}' 的 dpad_modes.{mode_name}.{button} 不是方向键")
+                    continue
+                try:
+                    validate_action(spec, profile_name,
+                                    f"dpad_modes.{mode_name}.{button}",
+                                    quartz_available)
+                except QuartzUnavailableError as e:
+                    warnings.append(
+                        f"profile '{profile_name}' dpad_modes.{mode_name}.{button} 已跳过: {e}")
+                except ProfileError as e:
+                    errors.append(str(e))
+                except ShortcutError as e:
+                    errors.append(
+                        f"profile '{profile_name}' dpad_modes.{mode_name}.{button}: {e}")
+
     if errors:
         raise ProfileError("; ".join(errors))
     cleaned["bindings"] = cleaned_bindings
@@ -457,6 +520,35 @@ def run_shell_action(spec, ctx):
         subprocess.Popen(argv)
     except (OSError, ValueError) as e:
         _warn(f"shell action 启动失败: {e}")
+
+
+DIRECTION_SHORTCUTS = {
+    "dpad_up": "up",
+    "dpad_down": "down",
+    "dpad_left": "left",
+    "dpad_right": "right",
+}
+
+
+def dpad_mode_spec(options, bindings, mode_name, dpad_name):
+    modes = options.get("dpad_modes", {}) if options else {}
+    mode = modes.get(mode_name, {}) if isinstance(modes, dict) else {}
+    if isinstance(mode, dict) and dpad_name in mode:
+        return mode[dpad_name]
+    if mode_name == "default" and dpad_name in bindings:
+        return bindings.get(dpad_name)
+    return DIRECTION_SHORTCUTS.get(dpad_name)
+
+
+def dpad_repeat_config(options):
+    modes = options.get("dpad_modes", {}) if options else {}
+    repeat = modes.get("repeat", {}) if isinstance(modes, dict) else {}
+    if not isinstance(repeat, dict):
+        repeat = {}
+    return {
+        "delay": float(repeat.get("delay", 0.35)),
+        "interval": float(repeat.get("interval", 0.08)),
+    }
 
 
 def run_action(spec, ctx):
@@ -521,7 +613,7 @@ def load_profile_checked(name, quartz_available=True):
 
 
 def reload_profile_into(name, bindings, sticks, mtimes, quartz_available=True,
-                        errors_seen=None, logger=print):
+                        errors_seen=None, logger=print, options=None):
     pf = profile_path(name)
     state_mtime = _file_mtime(STATE_FILE)
     profile_mtime = _file_mtime(pf)
@@ -541,6 +633,11 @@ def reload_profile_into(name, bindings, sticks, mtimes, quartz_available=True,
     bindings.update(prof.get("bindings", {}) or {})
     sticks.clear()
     sticks.update(prof.get("sticks", {}) or {})
+    if options is not None:
+        options.clear()
+        options.update({
+            "dpad_modes": prof.get("dpad_modes", {}) or {},
+        })
     mtimes["state"] = state_mtime
     mtimes["profile"] = profile_mtime
     if errors_seen is not None:
@@ -875,6 +972,7 @@ def cmd_run(args):
     state = {"active": load_state().get("active", "default")}
     bindings = {}
     sticks = {}
+    profile_options = {}
     mtimes = {}
     errors_seen = {}
 
@@ -883,6 +981,7 @@ def cmd_run(args):
             state["active"], bindings, sticks, mtimes,
             quartz_available=_Q is not None,
             errors_seen=errors_seen,
+            options=profile_options,
         )
 
     def cycle(direction):
@@ -914,11 +1013,31 @@ def cmd_run(args):
     last_check = 0.0
     prev_loop = time.time()
     rstick = {"dir": None, "t": 0.0}   # right-stick-as-dpad repeat state
+    scroll_accum = {"x": 0.0, "y": 0.0}
+    dpad_state = {"mode": "default"}
+    hat_press_t = {}
+    hat_last_fire = {}
+    combo_pending = {}
+    combo_window = 0.12
 
     def axval(name):
         idx = axes_map.get(name)
         sign = axis_signs.get(name, 1)
         return joy.get_axis(idx) * sign if idx is not None else 0.0
+
+    def dpad_spec(dpad_name):
+        return dpad_mode_spec(
+            profile_options, bindings, dpad_state["mode"], dpad_name)
+
+    def dpad_toggle_combo():
+        modes = profile_options.get("dpad_modes", {}) or {}
+        return tuple(modes.get("toggle", ["L", "R"]))
+
+    def toggle_dpad_mode():
+        dpad_state["mode"] = (
+            "alternate" if dpad_state["mode"] == "default" else "default"
+        )
+        print(f"[mapper] 方向键模式: {dpad_state['mode']}")
 
     # register AFTER pygame.init so this overrides SDL's own signal handlers
     stop = {"flag": False}
@@ -950,8 +1069,29 @@ def cmd_run(args):
             for i in range(n):
                 cur = joy.get_button(i)
                 bname = idx_to_name.get(i)
-                spec = bindings.get(bname) if bname else None
+                if bname in DIRECTION_SHORTCUTS:
+                    spec = dpad_spec(bname)
+                else:
+                    spec = bindings.get(bname) if bname else None
                 if cur and not prev_btn[i]:
+                    combo = dpad_toggle_combo()
+                    if bname in combo:
+                        other = combo[1] if bname == combo[0] else combo[0]
+                        other_pending = combo_pending.get(other)
+                        if (other_pending is not None and
+                                now - other_pending["t"] <= combo_window):
+                            combo_pending.pop(other, None)
+                            toggle_dpad_mode()
+                        else:
+                            combo_pending[bname] = {
+                                "idx": i,
+                                "spec": spec,
+                                "t": now,
+                            }
+                        btn_press_t[i] = now
+                        btn_last_fire[i] = now
+                        prev_btn[i] = cur
+                        continue
                     if spec is not None:
                         run_action(spec, ctx)
                     btn_press_t[i] = now
@@ -963,22 +1103,52 @@ def cmd_run(args):
                     if now - btn_press_t[i] >= delay and now - btn_last_fire[i] >= interval:
                         run_action(spec, ctx)
                         btn_last_fire[i] = now
+                elif cur and bname in DIRECTION_SHORTCUTS:
+                    repeat = dpad_repeat_config(profile_options)
+                    if (now - btn_press_t[i] >= repeat["delay"] and
+                            now - btn_last_fire[i] >= repeat["interval"]):
+                        run_action(spec, ctx)
+                        btn_last_fire[i] = now
                 prev_btn[i] = cur
+
+            for bname, pending in list(combo_pending.items()):
+                idx = pending["idx"]
+                if now - pending["t"] >= combo_window or not prev_btn[idx]:
+                    if pending["spec"] is not None:
+                        run_action(pending["spec"], ctx)
+                    combo_pending.pop(bname, None)
 
             # dpad via hat (rising edge per direction)
             if dpad_mode == "hat" and joy.get_numhats() > dpad_hat:
                 hat = joy.get_hat(dpad_hat)
-                if hat != prev_hat:
-                    hx, hy = hat
-                    if hy == 1 and prev_hat[1] != 1:
-                        run_action(bindings.get("dpad_up"), ctx)
-                    if hy == -1 and prev_hat[1] != -1:
-                        run_action(bindings.get("dpad_down"), ctx)
-                    if hx == -1 and prev_hat[0] != -1:
-                        run_action(bindings.get("dpad_left"), ctx)
-                    if hx == 1 and prev_hat[0] != 1:
-                        run_action(bindings.get("dpad_right"), ctx)
-                    prev_hat = hat
+                hx, hy = hat
+                hat_dirs = {
+                    "dpad_up": hy == 1,
+                    "dpad_down": hy == -1,
+                    "dpad_left": hx == -1,
+                    "dpad_right": hx == 1,
+                }
+                prev_hat_dirs = {
+                    "dpad_up": prev_hat[1] == 1,
+                    "dpad_down": prev_hat[1] == -1,
+                    "dpad_left": prev_hat[0] == -1,
+                    "dpad_right": prev_hat[0] == 1,
+                }
+                repeat = dpad_repeat_config(profile_options)
+                for dpad_name, pressed in hat_dirs.items():
+                    if pressed and not prev_hat_dirs[dpad_name]:
+                        run_action(dpad_spec(dpad_name), ctx)
+                        hat_press_t[dpad_name] = now
+                        hat_last_fire[dpad_name] = now
+                    elif pressed:
+                        if (now - hat_press_t.get(dpad_name, now) >= repeat["delay"] and
+                                now - hat_last_fire.get(dpad_name, 0) >= repeat["interval"]):
+                            run_action(dpad_spec(dpad_name), ctx)
+                            hat_last_fire[dpad_name] = now
+                    else:
+                        hat_press_t.pop(dpad_name, None)
+                        hat_last_fire.pop(dpad_name, None)
+                prev_hat = hat
 
             # analog triggers as buttons (rising edge over threshold)
             for a, aname in axis_buttons.items():
@@ -1022,6 +1192,29 @@ def cmd_run(args):
                         rstick["t"] = now
                 else:
                     rstick["dir"] = None
+            elif rs and rs.get("mode") == "scroll" and _Q is not None and axes_map:
+                dz = float(rs.get("deadzone", 0.18))
+                speed = float(rs.get("speed", 900))
+                rx, ry = axval("rightx"), axval("righty")
+                if abs(rx) < dz:
+                    rx = 0.0
+                if abs(ry) < dz:
+                    ry = 0.0
+                if rs.get("invert_x"):
+                    rx = -rx
+                if rs.get("invert_y"):
+                    ry = -ry
+                if rx or ry:
+                    scroll_accum["x"] += rx * speed * dt
+                    scroll_accum["y"] += -ry * speed * dt
+                    dx, dy = int(scroll_accum["x"]), int(scroll_accum["y"])
+                    if dx or dy:
+                        mouse_scroll(_Q, dx, dy)
+                        scroll_accum["x"] -= dx
+                        scroll_accum["y"] -= dy
+                else:
+                    scroll_accum["x"] = 0.0
+                    scroll_accum["y"] = 0.0
 
             time.sleep(0.008)
     except KeyboardInterrupt:

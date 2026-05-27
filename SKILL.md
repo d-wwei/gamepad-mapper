@@ -91,14 +91,35 @@ sticks:
     speed: 900         # 像素/秒，调灵敏度
     deadzone: 0.15
   right:
-    mode: dpad         # 右摇杆按方向发 ↑↓←→
-    threshold: 0.6
-    repeat: 0.13       # 持续推时的连发间隔(秒)
+    mode: scroll       # 右摇杆滚动页面/列表
+    speed: 900
+    deadzone: 0.18
 ```
 
 - 左摇杆 `mode: mouse` 用 `CGWarpMouseCursorPosition`，**移动鼠标无需辅助功能授权**。
+- 右摇杆 `mode: scroll` 用 Quartz 滚轮事件滚动页面/列表，需辅助功能授权。
+- 右摇杆 `mode: dpad` 仍可按方向发 ↑↓←→，用于需要键盘方向键的 profile。
 - 鼠标点击（L3/R3 绑 `mouse_click`/`mouse_rightclick`）用事件注入，**需要辅助功能授权**。
 - 摇杆依赖 layout 里的 `axes`（leftx/lefty/rightx/righty）；`automap` 会自动写入。
+
+## 方向键模式 (dpad_modes)
+
+实体方向键可以设置默认/备用两套行为，并用两个键同时按下切换：
+
+```yaml
+dpad_modes:
+  toggle: [L, R]
+  repeat:
+    delay: 0.35
+    interval: 0.08
+  alternate:
+    dpad_up: shift+cmd+[
+    dpad_down: shift+cmd+]
+    dpad_left: ctrl+shift+tab
+    dpad_right: ctrl+tab
+```
+
+没有命中 `alternate` 时，实体方向键使用 `bindings.dpad_*`；适合默认做键盘 ↑↓←→，备用模式做 tab/面板切换。`repeat` 控制按住方向键后的连发。
 
 ## 常见任务（agent 操作指南）
 

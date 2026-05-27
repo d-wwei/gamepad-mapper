@@ -78,6 +78,69 @@ class ProfileValidationTests(unittest.TestCase):
         self.assertEqual(bindings, {"A": "return"})
         self.assertIn("继续使用上一份可用配置", logs[-1])
 
+    def test_reload_carries_dpad_modes(self):
+        self.write_profile(
+            "default",
+            "bindings:\n"
+            "  dpad_up: up\n"
+            "dpad_modes:\n"
+            "  toggle: [L, R]\n"
+            "  repeat:\n"
+            "    delay: 0.2\n"
+            "    interval: 0.05\n"
+            "  alternate:\n"
+            "    dpad_up: ctrl+tab\n",
+        )
+        bindings, sticks, mtimes, options = {}, {}, {}, {}
+        self.assertTrue(mapper.reload_profile_into(
+            "default", bindings, sticks, mtimes, logger=lambda _: None,
+            options=options))
+        self.assertEqual(bindings["dpad_up"], "up")
+        self.assertEqual(options["dpad_modes"]["alternate"]["dpad_up"], "ctrl+tab")
+        self.assertEqual(
+            mapper.dpad_repeat_config(options),
+            {"delay": 0.2, "interval": 0.05},
+        )
+
+    def test_invalid_dpad_repeat_rejects_profile(self):
+        self.write_profile(
+            "bad_repeat",
+            "bindings:\n"
+            "  dpad_up: up\n"
+            "dpad_modes:\n"
+            "  repeat:\n"
+            "    delay: nope\n",
+        )
+        with self.assertRaises(mapper.ProfileError):
+            mapper.load_profile_checked("bad_repeat")
+
+
+class DpadModeTests(unittest.TestCase):
+    def test_dpad_mode_spec_defaults_to_bindings(self):
+        self.assertEqual(
+            mapper.dpad_mode_spec({}, {"dpad_up": "up"}, "default", "dpad_up"),
+            "up",
+        )
+
+    def test_dpad_mode_spec_uses_alternate_mode(self):
+        options = {
+            "dpad_modes": {
+                "alternate": {
+                    "dpad_right": "ctrl+tab",
+                }
+            }
+        }
+        self.assertEqual(
+            mapper.dpad_mode_spec(options, {}, "alternate", "dpad_right"),
+            "ctrl+tab",
+        )
+
+    def test_dpad_repeat_config_defaults(self):
+        self.assertEqual(
+            mapper.dpad_repeat_config({}),
+            {"delay": 0.35, "interval": 0.08},
+        )
+
 
 class SdlMappingParserTests(unittest.TestCase):
     def test_parse_buttons_axes_and_hats(self):

@@ -6,30 +6,41 @@ bindings:
   Y:                       # 退格，长按连续删除
     keys: backspace
     repeat: true
-  R: cmd+space           # Spotlight
-  L: cmd+tab             # 切 App
+  R:
+    action: mouse_rightclick  # 鼠标右键（需辅助功能授权）
+  L:
+    action: mouse_click       # 鼠标左键（需辅助功能授权）
   ZR: ctrl+right         # 右切屏幕（需系统启用「移到右边一个空间」⌃→）
   ZL: ctrl+left          # 左切屏幕（需系统启用「移到左边一个空间」⌃←）
-  Home: f11              # 显示桌面（依赖系统「显示桌面」快捷键设置）
+  Home: ctrl+up          # 调度中心 / Mission Control
   Capture: cmd+shift+5   # 截图工具栏
-  dpad_up: shift+cmd+[
-  dpad_down: shift+cmd+]
-  dpad_right: ctrl+tab
-  dpad_left: ctrl+shift+tab
+  dpad_up: up            # 默认方向键模式：键盘 ↑
+  dpad_down: down        # 默认方向键模式：键盘 ↓
+  dpad_right: right      # 默认方向键模式：键盘 →
+  dpad_left: left        # 默认方向键模式：键盘 ←
   L3:
-    action: mouse_click        # 按下左摇杆 = 鼠标左键（需辅助功能授权）
-  R3:
-    action: mouse_rightclick   # 按下右摇杆 = 鼠标右键（需辅助功能授权）
-  # 右修饰键 / 纯修饰键：用 Quartz 按精确键码发送（右Ctrl=62, 右Shift=60）
-  X: rctrl                 # 单独右 Ctrl
+    keys: cmd+tab          # 切 App
+  R3: cmd+space            # Spotlight
+  # 右修饰键 / 纯修饰键：用 Quartz 按精确键码发送（右Option=61, 右Shift=60）
+  X: roption               # 单独右 Option
   Plus: alt+cmd+n          # ⌥⌘N — codex 创建新会话
-  Minus: rctrl+rshift      # 右 Ctrl + 右 Shift
+  Minus: roption+rshift    # 右 Option + 右 Shift
+dpad_modes:
+  toggle: [L, R]            # 同时按 L+R 切换实体方向键模式
+  repeat:
+    delay: 0.35             # 按住方向键多久后开始连发
+    interval: 0.08          # 连发间隔
+  alternate:
+    dpad_up: shift+cmd+[    # 原快捷键模式：上一个面板/标签组
+    dpad_down: shift+cmd+]  # 原快捷键模式：下一个面板/标签组
+    dpad_right: ctrl+tab    # 下一个 tab
+    dpad_left: ctrl+shift+tab # 上一个 tab
 sticks:
   left:
     mode: mouse            # 左摇杆控制鼠标移动（warp，无需授权）
     speed: 900             # 像素/秒，可调
     deadzone: 0.15
   right:
-    mode: dpad             # 右摇杆按方向发 ↑↓←→
-    threshold: 0.6
-    repeat: 0.13           # 持续推时的连发间隔（秒）
+    mode: scroll           # 右摇杆滚动页面/列表
+    speed: 900             # 像素/秒，可调
+    deadzone: 0.18

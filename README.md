@@ -8,8 +8,8 @@ recognizes.
 
 - Map buttons to keyboard shortcuts — including **left/right-specific** modifiers
   (`rctrl`, `rshift`, …) and **pure-modifier** chords, which AppleScript can't do
-- Left stick → mouse movement; stick presses (L3/R3) → mouse clicks
-- Right stick → arrow keys
+- Left stick → mouse movement; stick buttons can be mapped like any button
+- Right stick → arrow keys or page/list scrolling
 - **Hold-to-repeat** for any key (e.g. backspace)
 - Multiple **profiles** with **live hot-reload** — edit a profile, no restart
 - **`automap`**: auto-generate a layout for any SDL-known controller (no manual
@@ -77,7 +77,15 @@ bindings:
   #   argv: ["open", "-a", "Terminal"]
 sticks:
   left:  {mode: mouse, speed: 900, deadzone: 0.15}
-  right: {mode: dpad, threshold: 0.6, repeat: 0.13}
+  right: {mode: scroll, speed: 900, deadzone: 0.18}
+dpad_modes:
+  toggle: [L, R]             # press together to switch physical D-pad mode
+  repeat: {delay: 0.35, interval: 0.08}
+  alternate:
+    dpad_up: shift+cmd+[
+    dpad_down: shift+cmd+]
+    dpad_left: ctrl+shift+tab
+    dpad_right: ctrl+tab
 ```
 
 Button names follow the labels printed on the pad (`A B X Y · L R · ZL ZR ·
