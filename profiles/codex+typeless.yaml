@@ -39,8 +39,21 @@ sticks:
   left:
     mode: mouse            # 左摇杆控制鼠标移动（warp，无需授权）
     speed: 900             # 像素/秒，可调
-    deadzone: 0.15
+    deadzone: 0.22
+    settle: 0.8             # 连接/重载后先忽略摇杆抖动
+    center_max: 0.35        # 静止中心漂移在此范围内会被归零
+    center_stability: 0.12  # 采样足够稳定才采用中心归零
+    recenter_after: 0.6     # 强推动后释放且稳定时重新归零
+    active_threshold: 0.55
   right:
     mode: scroll           # 右摇杆滚动页面/列表
     speed: 900             # 像素/秒，可调
-    deadzone: 0.18
+    deadzone: 0.10
+    deadzone_x: 0.16       # 横向阈值稍高，保留横向滚动但挡住抖动
+    deadzone_y: 0.10       # 纵向滚动保持灵敏
+    horizontal: true
+    settle: 0.8
+    center_max: 0.35
+    center_stability: 0.12
+    recenter_after: 0.6
+    active_threshold: 0.55

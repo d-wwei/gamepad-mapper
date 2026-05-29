@@ -76,8 +76,8 @@ bindings:
   #   action: shell
   #   argv: ["open", "-a", "Terminal"]
 sticks:
-  left:  {mode: mouse, speed: 900, deadzone: 0.15}
-  right: {mode: scroll, speed: 900, deadzone: 0.18}
+  left:  {mode: mouse, speed: 900, deadzone: 0.22, settle: 0.8, center_max: 0.35, recenter_after: 0.6}
+  right: {mode: scroll, speed: 900, deadzone_y: 0.10, deadzone_x: 0.16, settle: 0.8, center_max: 0.35, recenter_after: 0.6}
 dpad_modes:
   toggle: [L, R]             # press together to switch physical D-pad mode
   repeat: {delay: 0.35, interval: 0.08}

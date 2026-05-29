@@ -445,7 +445,10 @@ def validate_profile(profile, profile_name, quartz_available=True):
             if not isinstance(stick_spec, dict):
                 errors.append(f"profile '{profile_name}' stick '{stick_name}' 必须是 mapping")
                 continue
-            for key in ("speed", "deadzone", "threshold", "repeat"):
+            for key in ("speed", "deadzone", "threshold", "repeat",
+                        "deadzone_x", "deadzone_y",
+                        "settle", "center_max", "center_stability",
+                        "recenter_after", "active_threshold"):
                 if key in stick_spec:
                     try:
                         float(stick_spec[key])
@@ -549,6 +552,129 @@ def dpad_repeat_config(options):
         "delay": float(repeat.get("delay", 0.35)),
         "interval": float(repeat.get("interval", 0.08)),
     }
+
+
+STICK_AXES = {
+    "left": ("leftx", "lefty"),
+    "right": ("rightx", "righty"),
+}
+
+
+def _median(values):
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _stable_center(samples, center_max, stability):
+    if not samples:
+        return None
+    center = _median(samples)
+    if abs(center) > center_max:
+        return None
+    near = sum(1 for value in samples if abs(value - center) <= stability)
+    if near / len(samples) < 0.7:
+        return None
+    return center
+
+
+def _axis_debug_enabled():
+    return _env_enabled("GAMEPAD_MAPPER_DEBUG_AXIS")
+
+
+def _debug_axis(message):
+    if _axis_debug_enabled():
+        print(message, flush=True)
+
+
+class AxisStartupFilter:
+    """Suppress startup stick noise, then subtract small center offsets."""
+
+    def __init__(self):
+        self.axes = {}
+
+    def configure(self, sticks, axes_map, now=None):
+        now = time.time() if now is None else now
+        self.axes.clear()
+        for stick_name, axis_names in STICK_AXES.items():
+            spec = sticks.get(stick_name)
+            if not isinstance(spec, dict) or not spec.get("mode"):
+                continue
+            settle = float(spec.get("settle", 0.8))
+            center_max = float(spec.get("center_max", 0.35))
+            center_stability = float(spec.get("center_stability", 0.12))
+            recenter_after = float(spec.get("recenter_after", 0.6))
+            active_threshold = float(spec.get("active_threshold", 0.55))
+            for axis_name in axis_names:
+                if axis_name in axes_map:
+                    self.axes[axis_name] = {
+                        "ready_at": now + settle,
+                        "center_max": center_max,
+                        "center_stability": center_stability,
+                        "recenter_after": recenter_after,
+                        "active_threshold": active_threshold,
+                        "offset": None,
+                        "samples": [],
+                        "recenter_armed": False,
+                        "recenter_start": None,
+                        "recenter_samples": [],
+                    }
+
+    def apply(self, axis_name, value, now=None):
+        state = self.axes.get(axis_name)
+        if state is None:
+            return value
+        now = time.time() if now is None else now
+        if now < state["ready_at"]:
+            state["samples"].append(value)
+            return 0.0
+        if state["offset"] is None:
+            samples = state["samples"] or [value]
+            center = _stable_center(
+                samples, state["center_max"], state["center_stability"])
+            state["offset"] = center if center is not None else 0.0
+            state["samples"] = []
+            _debug_axis(
+                f"[mapper] axis center {axis_name}: "
+                f"offset={state['offset']:+.4f} samples={len(samples)}"
+            )
+        value -= state["offset"]
+        if abs(value) >= state["active_threshold"]:
+            state["recenter_armed"] = True
+            state["recenter_start"] = None
+            state["recenter_samples"] = []
+        elif state["recenter_armed"] and abs(value + state["offset"]) <= state["center_max"]:
+            if state["recenter_start"] is None:
+                state["recenter_start"] = now
+                state["recenter_samples"] = []
+            state["recenter_samples"].append(value + state["offset"])
+            if now - state["recenter_start"] >= state["recenter_after"]:
+                center = _stable_center(
+                    state["recenter_samples"],
+                    state["center_max"],
+                    state["center_stability"],
+                )
+                if center is not None:
+                    raw_value = value + state["offset"]
+                    state["offset"] = center
+                    value = raw_value - state["offset"]
+                    _debug_axis(
+                        f"[mapper] axis recenter {axis_name}: "
+                        f"offset={state['offset']:+.4f} "
+                        f"samples={len(state['recenter_samples'])}"
+                    )
+                state["recenter_armed"] = False
+                state["recenter_start"] = None
+                state["recenter_samples"] = []
+        else:
+            state["recenter_start"] = None
+            state["recenter_samples"] = []
+        return max(-1.0, min(1.0, value))
 
 
 def run_action(spec, ctx):
@@ -973,16 +1099,20 @@ def cmd_run(args):
     bindings = {}
     sticks = {}
     profile_options = {}
+    axis_filter = AxisStartupFilter()
     mtimes = {}
     errors_seen = {}
 
     def reload_bindings():
-        return reload_profile_into(
+        ok = reload_profile_into(
             state["active"], bindings, sticks, mtimes,
             quartz_available=_Q is not None,
             errors_seen=errors_seen,
             options=profile_options,
         )
+        if ok:
+            axis_filter.configure(sticks, axes_map)
+        return ok
 
     def cycle(direction):
         profs = list_profiles()
@@ -1023,7 +1153,9 @@ def cmd_run(args):
     def axval(name):
         idx = axes_map.get(name)
         sign = axis_signs.get(name, 1)
-        return joy.get_axis(idx) * sign if idx is not None else 0.0
+        if idx is None:
+            return 0.0
+        return axis_filter.apply(name, joy.get_axis(idx) * sign)
 
     def dpad_spec(dpad_name):
         return dpad_mode_spec(
@@ -1194,11 +1326,17 @@ def cmd_run(args):
                     rstick["dir"] = None
             elif rs and rs.get("mode") == "scroll" and _Q is not None and axes_map:
                 dz = float(rs.get("deadzone", 0.18))
+                dz_x = float(rs.get("deadzone_x", dz))
+                dz_y = float(rs.get("deadzone_y", dz))
                 speed = float(rs.get("speed", 900))
                 rx, ry = axval("rightx"), axval("righty")
-                if abs(rx) < dz:
+                if rs.get("horizontal") is False:
                     rx = 0.0
-                if abs(ry) < dz:
+                if rs.get("vertical") is False:
+                    ry = 0.0
+                if abs(rx) < dz_x:
+                    rx = 0.0
+                if abs(ry) < dz_y:
                     ry = 0.0
                 if rs.get("invert_x"):
                     rx = -rx

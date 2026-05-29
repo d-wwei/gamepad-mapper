@@ -89,16 +89,30 @@ sticks:
   left:
     mode: mouse        # 左摇杆控制鼠标移动
     speed: 900         # 像素/秒，调灵敏度
-    deadzone: 0.15
+    deadzone: 0.22
+    settle: 0.8        # 连接/重载后先忽略摇杆抖动
+    center_max: 0.35   # 稳定的中心漂移在此范围内会被归零
+    center_stability: 0.12
+    recenter_after: 0.6
+    active_threshold: 0.55
   right:
     mode: scroll       # 右摇杆滚动页面/列表
     speed: 900
-    deadzone: 0.18
+    deadzone_x: 0.16
+    deadzone_y: 0.10
+    horizontal: true
+    settle: 0.8
+    center_max: 0.35
+    center_stability: 0.12
+    recenter_after: 0.6
+    active_threshold: 0.55
 ```
 
 - 左摇杆 `mode: mouse` 用 `CGWarpMouseCursorPosition`，**移动鼠标无需辅助功能授权**。
 - 右摇杆 `mode: scroll` 用 Quartz 滚轮事件滚动页面/列表，需辅助功能授权。
+- `mode: scroll` 可设 `deadzone_x/deadzone_y` 分别控制横向/纵向阈值，也可用 `horizontal: false` 或 `vertical: false` 关闭某个方向。
 - 右摇杆 `mode: dpad` 仍可按方向发 ↑↓←→，用于需要键盘方向键的 profile。
+- `settle` 会在连接或 profile 重载后短暂忽略摇杆输入；`center_max` 内且足够稳定的中心漂移会被归零；强推动后释放并稳定 `recenter_after` 秒会再次归零。
 - 鼠标点击（L3/R3 绑 `mouse_click`/`mouse_rightclick`）用事件注入，**需要辅助功能授权**。
 - 摇杆依赖 layout 里的 `axes`（leftx/lefty/rightx/righty）；`automap` 会自动写入。
 

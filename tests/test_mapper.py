@@ -142,6 +142,108 @@ class DpadModeTests(unittest.TestCase):
         )
 
 
+class AxisStartupFilterTests(unittest.TestCase):
+    def test_default_settle_filter_subtracts_stable_center_offset(self):
+        filt = mapper.AxisStartupFilter()
+        filt.configure(
+            {"left": {"mode": "mouse", "settle": 0.5}},
+            {"leftx": 0, "lefty": 1},
+            now=5.0,
+        )
+
+        self.assertEqual(filt.apply("lefty", 0.12, now=5.2), 0.0)
+        self.assertEqual(filt.apply("lefty", 0.12, now=5.6), 0.0)
+
+    def test_center_offset_can_be_disabled(self):
+        filt = mapper.AxisStartupFilter()
+        filt.configure(
+            {"left": {"mode": "mouse", "settle": 0.5, "center_max": 0}},
+            {"leftx": 0, "lefty": 1},
+            now=5.0,
+        )
+
+        self.assertEqual(filt.apply("lefty", 0.12, now=5.2), 0.0)
+        self.assertEqual(filt.apply("lefty", 0.12, now=5.6), 0.12)
+
+    def test_suppresses_axes_until_settled_then_subtracts_center_offset(self):
+        filt = mapper.AxisStartupFilter()
+        filt.configure(
+            {"left": {"mode": "mouse", "settle": 0.5, "center_max": 0.3}},
+            {"leftx": 0, "lefty": 1},
+            now=10.0,
+        )
+
+        self.assertEqual(filt.apply("lefty", 0.22, now=10.2), 0.0)
+        self.assertEqual(filt.apply("lefty", 0.24, now=10.4), 0.0)
+        self.assertAlmostEqual(filt.apply("lefty", 0.22, now=10.6), -0.01)
+        self.assertAlmostEqual(filt.apply("lefty", 0.30, now=10.7), 0.07)
+
+    def test_center_offset_uses_settle_window_median(self):
+        filt = mapper.AxisStartupFilter()
+        filt.configure(
+            {"right": {"mode": "scroll", "settle": 0.5, "center_max": 0.3}},
+            {"rightx": 2, "righty": 3},
+            now=30.0,
+        )
+
+        for value in (0.04, 0.05, 0.90, 0.04, 0.05):
+            self.assertEqual(filt.apply("rightx", value, now=30.2), 0.0)
+        self.assertAlmostEqual(filt.apply("rightx", 0.07, now=30.6), 0.02)
+
+    def test_large_initial_axis_value_is_not_treated_as_center(self):
+        filt = mapper.AxisStartupFilter()
+        filt.configure(
+            {"right": {"mode": "scroll", "settle": 0.1, "center_max": 0.3}},
+            {"rightx": 2, "righty": 3},
+            now=20.0,
+        )
+
+        self.assertEqual(filt.apply("righty", 0.8, now=20.2), 0.8)
+
+    def test_unstable_initial_axis_values_are_not_treated_as_center(self):
+        filt = mapper.AxisStartupFilter()
+        filt.configure(
+            {
+                "left": {
+                    "mode": "mouse",
+                    "settle": 0.5,
+                    "center_max": 0.35,
+                    "center_stability": 0.05,
+                }
+            },
+            {"leftx": 0, "lefty": 1},
+            now=40.0,
+        )
+
+        for value in (-0.25, 0.25, -0.25, 0.25):
+            self.assertEqual(filt.apply("lefty", value, now=40.2), 0.0)
+        self.assertEqual(filt.apply("lefty", 0.25, now=40.6), 0.25)
+
+    def test_recenters_after_strong_movement_returns_to_stable_drift(self):
+        filt = mapper.AxisStartupFilter()
+        filt.configure(
+            {
+                "left": {
+                    "mode": "mouse",
+                    "settle": 0.1,
+                    "center_max": 0.35,
+                    "center_stability": 0.05,
+                    "recenter_after": 0.2,
+                    "active_threshold": 0.55,
+                }
+            },
+            {"leftx": 0, "lefty": 1},
+            now=50.0,
+        )
+
+        self.assertEqual(filt.apply("lefty", 0.06, now=50.05), 0.0)
+        self.assertEqual(filt.apply("lefty", 0.06, now=50.2), 0.0)
+        self.assertGreater(filt.apply("lefty", 0.9, now=50.3), 0.55)
+        self.assertAlmostEqual(filt.apply("lefty", 0.25, now=50.4), 0.19)
+        self.assertAlmostEqual(filt.apply("lefty", 0.25, now=50.5), 0.19)
+        self.assertEqual(filt.apply("lefty", 0.25, now=50.7), 0.0)
+
+
 class SdlMappingParserTests(unittest.TestCase):
     def test_parse_buttons_axes_and_hats(self):
         self.assertEqual(
