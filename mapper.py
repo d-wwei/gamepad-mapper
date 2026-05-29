@@ -12,7 +12,9 @@ Layer 2 (later): the same dispatch supports action: shell / claude for agent hoo
 import argparse
 import json
 import os
+import re
 import signal
+import shlex
 import subprocess
 import sys
 import time
@@ -22,6 +24,7 @@ BASE = Path(__file__).resolve().parent
 PROFILES_DIR = BASE / "profiles"
 LAYOUTS_DIR = BASE / "layouts"
 STATE_FILE = BASE / "state.json"
+OSASCRIPT = "/usr/bin/osascript"
 
 try:
     import yaml
@@ -133,11 +136,60 @@ def require_yaml():
                  ".venv/bin/python mapper.py ...")
 
 
+class MapperError(Exception):
+    """Base exception for user-fixable mapper configuration errors."""
+
+
+class ShortcutError(MapperError):
+    """Raised when a shortcut cannot be parsed safely."""
+
+
+class QuartzUnavailableError(ShortcutError):
+    """Raised when a valid shortcut needs Quartz but Quartz is unavailable."""
+
+
+class ProfileError(MapperError):
+    """Raised when a profile cannot be loaded or validated."""
+
+
+class LayoutError(MapperError):
+    """Raised when a layout cannot be loaded or validated."""
+
+
+class SdlMappingError(MapperError):
+    """Raised when an SDL mapping token is unsupported."""
+
+
+def _warn(message):
+    print(f"[mapper] 警告: {message}", file=sys.stderr)
+
+
+def _env_enabled(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _file_mtime(path):
+    return path.stat().st_mtime if path.exists() else 0
+
+
+def _load_yaml_file(path, label):
+    require_yaml()
+    if not path.exists():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except Exception as e:
+        raise ProfileError(f"{label} YAML 无法解析: {path}: {e}") from e
+    if not isinstance(data, dict):
+        raise ProfileError(f"{label} 顶层必须是 mapping: {path}")
+    return data
+
+
 # ---------------------------------------------------------------------------
 # AppleScript senders
 # ---------------------------------------------------------------------------
 def _osa(script):
-    subprocess.run(["osascript", "-e", script], check=False,
+    subprocess.run([OSASCRIPT, "-e", script], check=False,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -154,6 +206,43 @@ def _needs_quartz(parts):
     if len(low) == 1 and low[0] in _FORCE_QUARTZ_KEYS:
         return True
     return False
+
+
+def _is_modifier_token(token):
+    return token.lower() in MODIFIERS or token.lower() in MOD_KEYCODES
+
+
+def _is_key_token(token):
+    low = token.lower()
+    return low in KEYCODES or low in CHAR_KEYCODES or len(token) == 1
+
+
+def parse_shortcut(combo, quartz_available=True):
+    """Validate and classify a shortcut without silently dropping tokens."""
+    parts = [p.strip() for p in str(combo).split("+") if p.strip()]
+    if not parts:
+        raise ShortcutError("快捷键不能为空")
+
+    unknown = [p for p in parts if not _is_modifier_token(p) and not _is_key_token(p)]
+    if unknown:
+        raise ShortcutError(f"未知快捷键 token: {', '.join(unknown)}")
+
+    non_mods = [p for p in parts if not _is_modifier_token(p)]
+    pure_modifier = not non_mods
+    if len(non_mods) > 1:
+        raise ShortcutError(f"快捷键只能有一个主键: {combo}")
+    if pure_modifier and not all(p.lower() in MOD_KEYCODES for p in parts):
+        raise ShortcutError(f"纯修饰键只支持 Quartz 精确键码: {combo}")
+
+    requires_quartz = _needs_quartz(parts)
+    if requires_quartz and not quartz_available:
+        raise QuartzUnavailableError(f"需要 Quartz/pyobjc 才能发送: {combo}")
+
+    return {
+        "parts": parts,
+        "requires_quartz": requires_quartz,
+        "pure_modifier": pure_modifier,
+    }
 
 
 def send_keycombo_quartz(Q, combo):
@@ -197,10 +286,9 @@ def send_keycombo_quartz(Q, combo):
 
 def send_shortcut(combo, Q=None):
     """combo like 'cmd+shift+4', 'return', 'rctrl+l', 'rctrl' (pure modifier)."""
-    parts = [p.strip() for p in str(combo).split("+") if p.strip()]
-    if not parts:
-        return
-    if Q is not None and _needs_quartz(parts):
+    parsed = parse_shortcut(combo, quartz_available=Q is not None)
+    parts = parsed["parts"]
+    if parsed["requires_quartz"]:
         send_keycombo_quartz(Q, combo)
         return
     mods = [MODIFIERS[p.lower()] for p in parts[:-1] if p.lower() in MODIFIERS]
@@ -245,21 +333,371 @@ def mouse_click(Q, button="left"):
                       Q.CGEventCreateMouseEvent(None, ev, (x, y), b))
 
 
+def mouse_scroll(Q, dx=0, dy=0):
+    """Scroll by pixel deltas. Positive dx scrolls right; positive dy scrolls up."""
+    dx, dy = int(round(dx)), int(round(dy))
+    if not dx and not dy:
+        return
+    ev = Q.CGEventCreateScrollWheelEvent(
+        None, Q.kCGScrollEventUnitPixel, 2, dy, dx)
+    Q.CGEventPost(Q.kCGHIDEventTap, ev)
+
+
+def _validate_repeat(spec, where):
+    if "repeat" not in spec:
+        return
+    repeat = spec["repeat"]
+    if isinstance(repeat, bool):
+        return
+    if not isinstance(repeat, dict):
+        raise ProfileError(f"{where}: repeat 必须是 bool 或 mapping")
+    for key in ("delay", "interval"):
+        if key in repeat:
+            try:
+                value = float(repeat[key])
+            except (TypeError, ValueError) as e:
+                raise ProfileError(f"{where}: repeat.{key} 必须是数字") from e
+            if value <= 0:
+                raise ProfileError(f"{where}: repeat.{key} 必须大于 0")
+
+
+def _validate_timing_mapping(spec, where, keys):
+    if not isinstance(spec, dict):
+        raise ProfileError(f"{where} 必须是 mapping")
+    for key in keys:
+        if key in spec:
+            try:
+                value = float(spec[key])
+            except (TypeError, ValueError) as e:
+                raise ProfileError(f"{where}.{key} 必须是数字") from e
+            if value <= 0:
+                raise ProfileError(f"{where}.{key} 必须大于 0")
+
+
+def _validate_shell_spec(spec, where):
+    argv = spec.get("argv")
+    cmd = spec.get("cmd")
+    if argv is None and cmd is None:
+        raise ProfileError(f"{where}: shell action 需要 argv 或 cmd")
+    if argv is not None:
+        if (not isinstance(argv, list) or not argv or
+                not all(isinstance(v, str) and v for v in argv)):
+            raise ProfileError(f"{where}: shell argv 必须是非空字符串列表")
+    if cmd is not None and (not isinstance(cmd, str) or not cmd.strip()):
+        raise ProfileError(f"{where}: shell cmd 必须是非空字符串")
+
+
+def validate_action(spec, profile_name="<profile>", button_name="<button>",
+                    quartz_available=True):
+    where = f"profile '{profile_name}' binding '{button_name}'"
+    if isinstance(spec, str):
+        parse_shortcut(spec, quartz_available=quartz_available)
+        return
+    if not isinstance(spec, dict):
+        raise ProfileError(f"{where}: binding 必须是字符串或 mapping")
+
+    action = spec.get("action", "shortcut")
+    if not isinstance(action, str):
+        raise ProfileError(f"{where}: action 必须是字符串")
+
+    if action == "shortcut":
+        parse_shortcut(spec.get("keys", ""), quartz_available=quartz_available)
+    elif action == "text":
+        if "value" not in spec:
+            raise ProfileError(f"{where}: text action 需要 value")
+    elif action == "shell":
+        _validate_shell_spec(spec, where)
+    elif action in ("profile_next", "profile_prev", "mouse_click",
+                    "mouse_rightclick", "none"):
+        pass
+    else:
+        raise ProfileError(f"{where}: 未知 action: {action}")
+
+    _validate_repeat(spec, where)
+
+
+def validate_profile(profile, profile_name, quartz_available=True):
+    if not isinstance(profile, dict):
+        raise ProfileError(f"profile '{profile_name}' 顶层必须是 mapping")
+    bindings = profile.get("bindings", {}) or {}
+    if not isinstance(bindings, dict):
+        raise ProfileError(f"profile '{profile_name}' 的 bindings 必须是 mapping")
+    cleaned = dict(profile)
+    cleaned_bindings = dict(bindings)
+    errors = []
+    warnings = []
+    for button, spec in bindings.items():
+        try:
+            validate_action(spec, profile_name, button, quartz_available)
+        except QuartzUnavailableError as e:
+            cleaned_bindings.pop(button, None)
+            warnings.append(f"profile '{profile_name}' binding '{button}' 已跳过: {e}")
+        except ProfileError as e:
+            errors.append(str(e))
+        except ShortcutError as e:
+            errors.append(f"profile '{profile_name}' binding '{button}': {e}")
+
+    sticks = profile.get("sticks", {}) or {}
+    if not isinstance(sticks, dict):
+        errors.append(f"profile '{profile_name}' 的 sticks 必须是 mapping")
+    else:
+        for stick_name, stick_spec in sticks.items():
+            if not isinstance(stick_spec, dict):
+                errors.append(f"profile '{profile_name}' stick '{stick_name}' 必须是 mapping")
+                continue
+            for key in ("speed", "deadzone", "threshold", "repeat",
+                        "deadzone_x", "deadzone_y",
+                        "settle", "center_max", "center_stability",
+                        "recenter_after", "active_threshold"):
+                if key in stick_spec:
+                    try:
+                        float(stick_spec[key])
+                    except (TypeError, ValueError):
+                        errors.append(
+                            f"profile '{profile_name}' stick '{stick_name}.{key}' 必须是数字")
+
+    dpad_modes = profile.get("dpad_modes", {}) or {}
+    if not isinstance(dpad_modes, dict):
+        errors.append(f"profile '{profile_name}' 的 dpad_modes 必须是 mapping")
+    else:
+        toggle = dpad_modes.get("toggle", ["L", "R"])
+        if (not isinstance(toggle, list) or len(toggle) != 2 or
+                not all(isinstance(v, str) and v for v in toggle)):
+            errors.append(f"profile '{profile_name}' 的 dpad_modes.toggle 必须是两个按键名")
+        if "repeat" in dpad_modes:
+            try:
+                _validate_timing_mapping(
+                    dpad_modes["repeat"],
+                    f"profile '{profile_name}' 的 dpad_modes.repeat",
+                    ("delay", "interval"),
+                )
+            except ProfileError as e:
+                errors.append(str(e))
+        for mode_name in ("default", "alternate"):
+            mode = dpad_modes.get(mode_name, {}) or {}
+            if not isinstance(mode, dict):
+                errors.append(f"profile '{profile_name}' 的 dpad_modes.{mode_name} 必须是 mapping")
+                continue
+            for button, spec in mode.items():
+                if button not in ("dpad_up", "dpad_down", "dpad_left", "dpad_right"):
+                    errors.append(
+                        f"profile '{profile_name}' 的 dpad_modes.{mode_name}.{button} 不是方向键")
+                    continue
+                try:
+                    validate_action(spec, profile_name,
+                                    f"dpad_modes.{mode_name}.{button}",
+                                    quartz_available)
+                except QuartzUnavailableError as e:
+                    warnings.append(
+                        f"profile '{profile_name}' dpad_modes.{mode_name}.{button} 已跳过: {e}")
+                except ProfileError as e:
+                    errors.append(str(e))
+                except ShortcutError as e:
+                    errors.append(
+                        f"profile '{profile_name}' dpad_modes.{mode_name}.{button}: {e}")
+
+    if errors:
+        raise ProfileError("; ".join(errors))
+    cleaned["bindings"] = cleaned_bindings
+    if warnings:
+        cleaned["_warnings"] = warnings
+    return cleaned
+
+
+def _shell_argv(spec):
+    if spec.get("argv") is not None:
+        return list(spec["argv"])
+    return shlex.split(spec.get("cmd", ""))
+
+
+def run_shell_action(spec, ctx):
+    if not ctx.get("allow_shell_actions", False):
+        _warn("shell action 已禁用；使用 --allow-shell-actions 或 "
+              "GAMEPAD_MAPPER_ALLOW_SHELL=1 显式启用")
+        return
+    try:
+        argv = _shell_argv(spec)
+        if not argv:
+            _warn("shell action argv/cmd 为空，已跳过")
+            return
+        subprocess.Popen(argv)
+    except (OSError, ValueError) as e:
+        _warn(f"shell action 启动失败: {e}")
+
+
+DIRECTION_SHORTCUTS = {
+    "dpad_up": "up",
+    "dpad_down": "down",
+    "dpad_left": "left",
+    "dpad_right": "right",
+}
+
+
+def dpad_mode_spec(options, bindings, mode_name, dpad_name):
+    modes = options.get("dpad_modes", {}) if options else {}
+    mode = modes.get(mode_name, {}) if isinstance(modes, dict) else {}
+    if isinstance(mode, dict) and dpad_name in mode:
+        return mode[dpad_name]
+    if mode_name == "default" and dpad_name in bindings:
+        return bindings.get(dpad_name)
+    return DIRECTION_SHORTCUTS.get(dpad_name)
+
+
+def dpad_repeat_config(options):
+    modes = options.get("dpad_modes", {}) if options else {}
+    repeat = modes.get("repeat", {}) if isinstance(modes, dict) else {}
+    if not isinstance(repeat, dict):
+        repeat = {}
+    return {
+        "delay": float(repeat.get("delay", 0.35)),
+        "interval": float(repeat.get("interval", 0.08)),
+    }
+
+
+STICK_AXES = {
+    "left": ("leftx", "lefty"),
+    "right": ("rightx", "righty"),
+}
+
+
+def _median(values):
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _stable_center(samples, center_max, stability):
+    if not samples:
+        return None
+    center = _median(samples)
+    if abs(center) > center_max:
+        return None
+    near = sum(1 for value in samples if abs(value - center) <= stability)
+    if near / len(samples) < 0.7:
+        return None
+    return center
+
+
+def _axis_debug_enabled():
+    return _env_enabled("GAMEPAD_MAPPER_DEBUG_AXIS")
+
+
+def _debug_axis(message):
+    if _axis_debug_enabled():
+        print(message, flush=True)
+
+
+class AxisStartupFilter:
+    """Suppress startup stick noise, then subtract small center offsets."""
+
+    def __init__(self):
+        self.axes = {}
+
+    def configure(self, sticks, axes_map, now=None):
+        now = time.time() if now is None else now
+        self.axes.clear()
+        for stick_name, axis_names in STICK_AXES.items():
+            spec = sticks.get(stick_name)
+            if not isinstance(spec, dict) or not spec.get("mode"):
+                continue
+            settle = float(spec.get("settle", 0.8))
+            center_max = float(spec.get("center_max", 0.35))
+            center_stability = float(spec.get("center_stability", 0.12))
+            recenter_after = float(spec.get("recenter_after", 0.6))
+            active_threshold = float(spec.get("active_threshold", 0.55))
+            for axis_name in axis_names:
+                if axis_name in axes_map:
+                    self.axes[axis_name] = {
+                        "ready_at": now + settle,
+                        "center_max": center_max,
+                        "center_stability": center_stability,
+                        "recenter_after": recenter_after,
+                        "active_threshold": active_threshold,
+                        "offset": None,
+                        "samples": [],
+                        "recenter_armed": False,
+                        "recenter_start": None,
+                        "recenter_samples": [],
+                    }
+
+    def apply(self, axis_name, value, now=None):
+        state = self.axes.get(axis_name)
+        if state is None:
+            return value
+        now = time.time() if now is None else now
+        if now < state["ready_at"]:
+            state["samples"].append(value)
+            return 0.0
+        if state["offset"] is None:
+            samples = state["samples"] or [value]
+            center = _stable_center(
+                samples, state["center_max"], state["center_stability"])
+            state["offset"] = center if center is not None else 0.0
+            state["samples"] = []
+            _debug_axis(
+                f"[mapper] axis center {axis_name}: "
+                f"offset={state['offset']:+.4f} samples={len(samples)}"
+            )
+        value -= state["offset"]
+        if abs(value) >= state["active_threshold"]:
+            state["recenter_armed"] = True
+            state["recenter_start"] = None
+            state["recenter_samples"] = []
+        elif state["recenter_armed"] and abs(value + state["offset"]) <= state["center_max"]:
+            if state["recenter_start"] is None:
+                state["recenter_start"] = now
+                state["recenter_samples"] = []
+            state["recenter_samples"].append(value + state["offset"])
+            if now - state["recenter_start"] >= state["recenter_after"]:
+                center = _stable_center(
+                    state["recenter_samples"],
+                    state["center_max"],
+                    state["center_stability"],
+                )
+                if center is not None:
+                    raw_value = value + state["offset"]
+                    state["offset"] = center
+                    value = raw_value - state["offset"]
+                    _debug_axis(
+                        f"[mapper] axis recenter {axis_name}: "
+                        f"offset={state['offset']:+.4f} "
+                        f"samples={len(state['recenter_samples'])}"
+                    )
+                state["recenter_armed"] = False
+                state["recenter_start"] = None
+                state["recenter_samples"] = []
+        else:
+            state["recenter_start"] = None
+            state["recenter_samples"] = []
+        return max(-1.0, min(1.0, value))
+
+
 def run_action(spec, ctx):
     """spec is a str (shortcut) or dict {action: ...}."""
     if spec is None:
         return
     if isinstance(spec, str):
-        send_shortcut(spec, ctx.get("mouse"))
+        try:
+            send_shortcut(spec, ctx.get("mouse"))
+        except ShortcutError as e:
+            _warn(str(e))
         return
     if isinstance(spec, dict):
         action = spec.get("action", "shortcut")
         if action == "shortcut":
-            send_shortcut(spec.get("keys", ""), ctx.get("mouse"))
+            try:
+                send_shortcut(spec.get("keys", ""), ctx.get("mouse"))
+            except ShortcutError as e:
+                _warn(str(e))
         elif action == "text":
             type_text(spec.get("value", ""))
         elif action == "shell":
-            subprocess.Popen(spec.get("cmd", ""), shell=True)
+            run_shell_action(spec, ctx)
         elif action in ("profile_next", "profile_prev"):
             ctx["cycle"](action)
         elif action == "mouse_click":
@@ -279,8 +717,8 @@ def load_state():
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError) as e:
+            _warn(f"state.json 无法读取，使用 default: {e}")
     return {"active": "default"}
 
 
@@ -293,11 +731,47 @@ def profile_path(name):
 
 
 def load_profile(name):
-    require_yaml()
-    p = profile_path(name)
-    if not p.exists():
-        return {}
-    return yaml.safe_load(p.read_text()) or {}
+    return _load_yaml_file(profile_path(name), "profile")
+
+
+def load_profile_checked(name, quartz_available=True):
+    return validate_profile(load_profile(name), name, quartz_available)
+
+
+def reload_profile_into(name, bindings, sticks, mtimes, quartz_available=True,
+                        errors_seen=None, logger=print, options=None):
+    pf = profile_path(name)
+    state_mtime = _file_mtime(STATE_FILE)
+    profile_mtime = _file_mtime(pf)
+    try:
+        prof = load_profile_checked(name, quartz_available=quartz_available)
+    except ProfileError as e:
+        mtimes["state"] = state_mtime
+        mtimes["profile"] = profile_mtime
+        error_key = (str(pf), profile_mtime, str(e))
+        if errors_seen is None or errors_seen.get(str(pf)) != error_key:
+            if errors_seen is not None:
+                errors_seen[str(pf)] = error_key
+            logger(f"[mapper] profile '{name}' 未加载，继续使用上一份可用配置: {e}")
+        return False
+
+    bindings.clear()
+    bindings.update(prof.get("bindings", {}) or {})
+    sticks.clear()
+    sticks.update(prof.get("sticks", {}) or {})
+    if options is not None:
+        options.clear()
+        options.update({
+            "dpad_modes": prof.get("dpad_modes", {}) or {},
+        })
+    mtimes["state"] = state_mtime
+    mtimes["profile"] = profile_mtime
+    if errors_seen is not None:
+        errors_seen.pop(str(pf), None)
+    for warning in prof.get("_warnings", []):
+        logger(f"[mapper] 警告: {warning}")
+    logger(f"[mapper] 已加载 profile '{name}' ({len(bindings)} 个绑定)")
+    return True
 
 
 def list_profiles():
@@ -309,7 +783,14 @@ def load_layout_for(device_name):
     require_yaml()
     generic = None
     for f in sorted(LAYOUTS_DIR.glob("*.yaml")):
-        data = yaml.safe_load(f.read_text()) or {}
+        try:
+            data = yaml.safe_load(f.read_text()) or {}
+        except Exception as e:
+            _warn(f"布局 YAML 无法解析，已跳过 {f}: {e}")
+            continue
+        if not isinstance(data, dict):
+            _warn(f"布局顶层必须是 mapping，已跳过 {f}")
+            continue
         match = data.get("device_match", "")
         if match and match.lower() in device_name.lower():
             return data
@@ -360,8 +841,8 @@ def cmd_probe(args):
     print(f"设备名     : {joy.get_name()}")
     try:
         print(f"GUID       : {joy.get_guid()}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"GUID       : 无法读取 ({e})")
     print(f"按键数     : {joy.get_numbuttons()}")
     print(f"摇杆轴数   : {joy.get_numaxes()}")
     print(f"方向键(hat): {joy.get_numhats()}")
@@ -455,6 +936,30 @@ def cmd_calibrate(args):
     print(f"\n已写入布局: {out}")
 
 
+def parse_sdl_mapping_token(raw):
+    """Parse a compact SDL GameController mapping token."""
+    if raw is None:
+        raise SdlMappingError("empty token")
+    token = str(raw).strip()
+    if not token:
+        raise SdlMappingError("empty token")
+
+    m = re.fullmatch(r"b(\d+)", token)
+    if m:
+        return {"kind": "button", "index": int(m.group(1))}
+
+    m = re.fullmatch(r"([+-]?)a(\d+)", token)
+    if m:
+        sign = -1 if m.group(1) == "-" else 1
+        return {"kind": "axis", "index": int(m.group(2)), "sign": sign}
+
+    m = re.fullmatch(r"h(\d+)\.(\d+)", token)
+    if m:
+        return {"kind": "hat", "index": int(m.group(1)), "value": int(m.group(2))}
+
+    raise SdlMappingError(f"unsupported SDL mapping token: {token}")
+
+
 def cmd_automap(args):
     """Auto-generate a layout from SDL's GameController DB (no key presses)."""
     require_yaml()
@@ -482,31 +987,66 @@ def cmd_automap(args):
         "misc1": "Capture",
         "lefttrigger": "ZL", "righttrigger": "ZR",
     })
-    buttons, axis_buttons = {}, {}
+    buttons, axis_buttons, axis_button_dirs = {}, {}, {}
+    dpad_hat = None
+    warnings = []
     for sdl_name, target in sdl_to_name.items():
         raw = mapping.get(sdl_name)
         if not raw:
             continue
-        if raw.startswith("b"):
-            buttons[int(raw[1:])] = target
-        elif raw.startswith("a"):
-            axis_buttons[int(raw[1:])] = target
-    axes = {}
+        try:
+            token = parse_sdl_mapping_token(raw)
+        except SdlMappingError as e:
+            warnings.append(f"{sdl_name}={raw}: {e}")
+            continue
+        if token["kind"] == "button":
+            buttons[token["index"]] = target
+        elif token["kind"] == "axis":
+            axis_buttons[token["index"]] = target
+            if token["sign"] != 1:
+                axis_button_dirs[token["index"]] = token["sign"]
+        elif token["kind"] == "hat" and sdl_name.startswith("dp"):
+            if dpad_hat is None:
+                dpad_hat = token["index"]
+            elif dpad_hat != token["index"]:
+                warnings.append(f"{sdl_name}={raw}: 多个 hat index 暂不支持")
+        else:
+            warnings.append(f"{sdl_name}={raw}: 该目标暂不支持 hat 映射")
+
+    axes, axis_signs = {}, {}
     for sdl_axis in ("leftx", "lefty", "rightx", "righty"):
         raw = mapping.get(sdl_axis)
-        if raw and raw.startswith("a"):
-            axes[sdl_axis] = int(raw[1:])
+        if not raw:
+            continue
+        try:
+            token = parse_sdl_mapping_token(raw)
+        except SdlMappingError as e:
+            warnings.append(f"{sdl_axis}={raw}: {e}")
+            continue
+        if token["kind"] != "axis":
+            warnings.append(f"{sdl_axis}={raw}: 摇杆轴需要 axis token")
+            continue
+        axes[sdl_axis] = token["index"]
+        if token["sign"] != 1:
+            axis_signs[sdl_axis] = token["sign"]
+
     layout = {
         "device_match": name,
         "note": "auto-generated from SDL GameController DB (mapper.py automap)",
-        "dpad": "buttons",
+        "dpad": "hat" if dpad_hat is not None else "buttons",
         "buttons": dict(sorted(buttons.items())),
     }
+    if dpad_hat is not None:
+        layout["hat"] = dpad_hat
     if axis_buttons:
         layout["axis_buttons"] = dict(sorted(axis_buttons.items()))
         layout["axis_threshold"] = 0.5
+    if axis_button_dirs:
+        layout["axis_button_dirs"] = dict(sorted(axis_button_dirs.items()))
     if axes:
         layout["axes"] = axes
+    if axis_signs:
+        layout["axis_signs"] = axis_signs
     slug = "".join(ch if ch.isalnum() else "-" for ch in name.lower()).strip("-")
     out = LAYOUTS_DIR / f"{slug}.yaml"
     LAYOUTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -515,6 +1055,8 @@ def cmd_automap(args):
     print(f"  设备     : {name}")
     print(f"  面键映射 : a/b/x/y 按手柄标签直通")
     print(f"  按钮 {len(buttons)} 个 / 扳机轴 {len(axis_buttons)} 个")
+    for warning in warnings:
+        print(f"  警告     : {warning}")
 
 
 def cmd_run(args):
@@ -526,18 +1068,28 @@ def cmd_run(args):
         print(f"找不到匹配 '{name}' 的布局，请先运行: mapper.py calibrate")
         return
 
-    raw_buttons = layout.get("buttons", {}) or {}
-    # map: button index -> binding name
-    idx_to_name = {int(k): v for k, v in raw_buttons.items()}
-    dpad_mode = layout.get("dpad", "hat")
-    # analog triggers reported as axes (e.g. Switch ZL/ZR -> a4/a5)
-    axis_buttons = {int(k): v for k, v in (layout.get("axis_buttons") or {}).items()}
-    axis_threshold = float(layout.get("axis_threshold", 0.5))
-    # analog stick axis indices (leftx/lefty/rightx/righty -> axis number)
-    axes_map = {k: int(v) for k, v in (layout.get("axes") or {}).items()}
+    try:
+        raw_buttons = layout.get("buttons", {}) or {}
+        # map: button index -> binding name
+        idx_to_name = {int(k): v for k, v in raw_buttons.items()}
+        dpad_mode = layout.get("dpad", "hat")
+        dpad_hat = int(layout.get("hat", 0))
+        # analog triggers reported as axes (e.g. Switch ZL/ZR -> a4/a5)
+        axis_buttons = {int(k): v for k, v in (layout.get("axis_buttons") or {}).items()}
+        axis_button_dirs = {
+            int(k): int(v) for k, v in (layout.get("axis_button_dirs") or {}).items()
+        }
+        axis_threshold = float(layout.get("axis_threshold", 0.5))
+        # analog stick axis indices (leftx/lefty/rightx/righty -> axis number)
+        axes_map = {k: int(v) for k, v in (layout.get("axes") or {}).items()}
+        axis_signs = {k: int(v) for k, v in (layout.get("axis_signs") or {}).items()}
+    except (TypeError, ValueError) as e:
+        print(f"布局格式错误，请重新运行 automap/calibrate: {e}")
+        return
 
-    # Quartz powers stick->mouse and L3/R3 clicks; optional, so everything else
-    # still works if pyobjc is unavailable.
+    # Quartz powers stick->mouse, clicks, and exact keycodes. Bindings that need
+    # Quartz are skipped if pyobjc is unavailable; ordinary AppleScript
+    # shortcuts still work.
     try:
         import Quartz as _Q
     except ImportError:
@@ -546,19 +1098,21 @@ def cmd_run(args):
     state = {"active": load_state().get("active", "default")}
     bindings = {}
     sticks = {}
+    profile_options = {}
+    axis_filter = AxisStartupFilter()
     mtimes = {}
+    errors_seen = {}
 
     def reload_bindings():
-        prof = load_profile(state["active"])
-        bindings.clear()
-        bindings.update(prof.get("bindings", {}) or {})
-        sticks.clear()
-        sticks.update(prof.get("sticks", {}) or {})
-        mtimes["state"] = STATE_FILE.stat().st_mtime if STATE_FILE.exists() else 0
-        pf = profile_path(state["active"])
-        mtimes["profile"] = pf.stat().st_mtime if pf.exists() else 0
-        print(f"[mapper] 已加载 profile '{state['active']}' "
-              f"({len(bindings)} 个绑定)")
+        ok = reload_profile_into(
+            state["active"], bindings, sticks, mtimes,
+            quartz_available=_Q is not None,
+            errors_seen=errors_seen,
+            options=profile_options,
+        )
+        if ok:
+            axis_filter.configure(sticks, axes_map)
+        return ok
 
     def cycle(direction):
         profs = list_profiles()
@@ -570,7 +1124,13 @@ def cmd_run(args):
         save_state({"active": state["active"]})
         reload_bindings()
 
-    ctx = {"cycle": cycle, "mouse": _Q}
+    ctx = {
+        "cycle": cycle,
+        "mouse": _Q,
+        "allow_shell_actions": (
+            args.allow_shell_actions or _env_enabled("GAMEPAD_MAPPER_ALLOW_SHELL")
+        ),
+    }
     reload_bindings()
     print(f"[mapper] 监听中: {name}. 改 profile 会自动热重载。Ctrl-C 退出。")
 
@@ -583,10 +1143,33 @@ def cmd_run(args):
     last_check = 0.0
     prev_loop = time.time()
     rstick = {"dir": None, "t": 0.0}   # right-stick-as-dpad repeat state
+    scroll_accum = {"x": 0.0, "y": 0.0}
+    dpad_state = {"mode": "default"}
+    hat_press_t = {}
+    hat_last_fire = {}
+    combo_pending = {}
+    combo_window = 0.12
 
     def axval(name):
         idx = axes_map.get(name)
-        return joy.get_axis(idx) if idx is not None else 0.0
+        sign = axis_signs.get(name, 1)
+        if idx is None:
+            return 0.0
+        return axis_filter.apply(name, joy.get_axis(idx) * sign)
+
+    def dpad_spec(dpad_name):
+        return dpad_mode_spec(
+            profile_options, bindings, dpad_state["mode"], dpad_name)
+
+    def dpad_toggle_combo():
+        modes = profile_options.get("dpad_modes", {}) or {}
+        return tuple(modes.get("toggle", ["L", "R"]))
+
+    def toggle_dpad_mode():
+        dpad_state["mode"] = (
+            "alternate" if dpad_state["mode"] == "default" else "default"
+        )
+        print(f"[mapper] 方向键模式: {dpad_state['mode']}")
 
     # register AFTER pygame.init so this overrides SDL's own signal handlers
     stop = {"flag": False}
@@ -618,8 +1201,29 @@ def cmd_run(args):
             for i in range(n):
                 cur = joy.get_button(i)
                 bname = idx_to_name.get(i)
-                spec = bindings.get(bname) if bname else None
+                if bname in DIRECTION_SHORTCUTS:
+                    spec = dpad_spec(bname)
+                else:
+                    spec = bindings.get(bname) if bname else None
                 if cur and not prev_btn[i]:
+                    combo = dpad_toggle_combo()
+                    if bname in combo:
+                        other = combo[1] if bname == combo[0] else combo[0]
+                        other_pending = combo_pending.get(other)
+                        if (other_pending is not None and
+                                now - other_pending["t"] <= combo_window):
+                            combo_pending.pop(other, None)
+                            toggle_dpad_mode()
+                        else:
+                            combo_pending[bname] = {
+                                "idx": i,
+                                "spec": spec,
+                                "t": now,
+                            }
+                        btn_press_t[i] = now
+                        btn_last_fire[i] = now
+                        prev_btn[i] = cur
+                        continue
                     if spec is not None:
                         run_action(spec, ctx)
                     btn_press_t[i] = now
@@ -631,26 +1235,57 @@ def cmd_run(args):
                     if now - btn_press_t[i] >= delay and now - btn_last_fire[i] >= interval:
                         run_action(spec, ctx)
                         btn_last_fire[i] = now
+                elif cur and bname in DIRECTION_SHORTCUTS:
+                    repeat = dpad_repeat_config(profile_options)
+                    if (now - btn_press_t[i] >= repeat["delay"] and
+                            now - btn_last_fire[i] >= repeat["interval"]):
+                        run_action(spec, ctx)
+                        btn_last_fire[i] = now
                 prev_btn[i] = cur
 
+            for bname, pending in list(combo_pending.items()):
+                idx = pending["idx"]
+                if now - pending["t"] >= combo_window or not prev_btn[idx]:
+                    if pending["spec"] is not None:
+                        run_action(pending["spec"], ctx)
+                    combo_pending.pop(bname, None)
+
             # dpad via hat (rising edge per direction)
-            if dpad_mode == "hat" and joy.get_numhats() > 0:
-                hat = joy.get_hat(0)
-                if hat != prev_hat:
-                    hx, hy = hat
-                    if hy == 1 and prev_hat[1] != 1:
-                        run_action(bindings.get("dpad_up"), ctx)
-                    if hy == -1 and prev_hat[1] != -1:
-                        run_action(bindings.get("dpad_down"), ctx)
-                    if hx == -1 and prev_hat[0] != -1:
-                        run_action(bindings.get("dpad_left"), ctx)
-                    if hx == 1 and prev_hat[0] != 1:
-                        run_action(bindings.get("dpad_right"), ctx)
-                    prev_hat = hat
+            if dpad_mode == "hat" and joy.get_numhats() > dpad_hat:
+                hat = joy.get_hat(dpad_hat)
+                hx, hy = hat
+                hat_dirs = {
+                    "dpad_up": hy == 1,
+                    "dpad_down": hy == -1,
+                    "dpad_left": hx == -1,
+                    "dpad_right": hx == 1,
+                }
+                prev_hat_dirs = {
+                    "dpad_up": prev_hat[1] == 1,
+                    "dpad_down": prev_hat[1] == -1,
+                    "dpad_left": prev_hat[0] == -1,
+                    "dpad_right": prev_hat[0] == 1,
+                }
+                repeat = dpad_repeat_config(profile_options)
+                for dpad_name, pressed in hat_dirs.items():
+                    if pressed and not prev_hat_dirs[dpad_name]:
+                        run_action(dpad_spec(dpad_name), ctx)
+                        hat_press_t[dpad_name] = now
+                        hat_last_fire[dpad_name] = now
+                    elif pressed:
+                        if (now - hat_press_t.get(dpad_name, now) >= repeat["delay"] and
+                                now - hat_last_fire.get(dpad_name, 0) >= repeat["interval"]):
+                            run_action(dpad_spec(dpad_name), ctx)
+                            hat_last_fire[dpad_name] = now
+                    else:
+                        hat_press_t.pop(dpad_name, None)
+                        hat_last_fire.pop(dpad_name, None)
+                prev_hat = hat
 
             # analog triggers as buttons (rising edge over threshold)
             for a, aname in axis_buttons.items():
-                pressed = joy.get_axis(a) > axis_threshold
+                direction = axis_button_dirs.get(a, 1)
+                pressed = joy.get_axis(a) * direction > axis_threshold
                 if pressed and not prev_axis[a]:
                     if aname in bindings:
                         run_action(bindings[aname], ctx)
@@ -689,6 +1324,35 @@ def cmd_run(args):
                         rstick["t"] = now
                 else:
                     rstick["dir"] = None
+            elif rs and rs.get("mode") == "scroll" and _Q is not None and axes_map:
+                dz = float(rs.get("deadzone", 0.18))
+                dz_x = float(rs.get("deadzone_x", dz))
+                dz_y = float(rs.get("deadzone_y", dz))
+                speed = float(rs.get("speed", 900))
+                rx, ry = axval("rightx"), axval("righty")
+                if rs.get("horizontal") is False:
+                    rx = 0.0
+                if rs.get("vertical") is False:
+                    ry = 0.0
+                if abs(rx) < dz_x:
+                    rx = 0.0
+                if abs(ry) < dz_y:
+                    ry = 0.0
+                if rs.get("invert_x"):
+                    rx = -rx
+                if rs.get("invert_y"):
+                    ry = -ry
+                if rx or ry:
+                    scroll_accum["x"] += rx * speed * dt
+                    scroll_accum["y"] += -ry * speed * dt
+                    dx, dy = int(scroll_accum["x"]), int(scroll_accum["y"])
+                    if dx or dy:
+                        mouse_scroll(_Q, dx, dy)
+                        scroll_accum["x"] -= dx
+                        scroll_accum["y"] -= dy
+                else:
+                    scroll_accum["x"] = 0.0
+                    scroll_accum["y"] = 0.0
 
             time.sleep(0.008)
     except KeyboardInterrupt:
@@ -698,14 +1362,22 @@ def cmd_run(args):
 def cmd_list(args):
     active = load_state().get("active", "default")
     for p in list_profiles():
-        prof = load_profile(p)
+        try:
+            prof = load_profile_checked(p, quartz_available=True)
+            desc = prof.get("description", "")
+        except ProfileError as e:
+            desc = f"(invalid: {e})"
         mark = "*" if p == active else " "
-        print(f"{mark} {p:<12} {prof.get('description', '')}")
+        print(f"{mark} {p:<12} {desc}")
 
 
 def cmd_switch(args):
     if not profile_path(args.name).exists():
         sys.exit(f"profile 不存在: {args.name} (可用: {', '.join(list_profiles())})")
+    try:
+        load_profile_checked(args.name, quartz_available=True)
+    except ProfileError as e:
+        sys.exit(f"profile 无效，未切换: {args.name}: {e}")
     save_state({"active": args.name})
     print(f"已切换到 profile '{args.name}'（若 mapper 正在运行会自动生效）")
 
@@ -740,7 +1412,9 @@ def cmd_status(args):
 def main():
     parser = argparse.ArgumentParser(prog="mapper.py", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("run", help="启动监听（常驻）")
+    run = sub.add_parser("run", help="启动监听（常驻）")
+    run.add_argument("--allow-shell-actions", action="store_true",
+                     help="允许 profile 执行 shell action（默认禁用）")
     sub.add_parser("list", help="列出所有 profile")
     sw = sub.add_parser("switch", help="切换 profile")
     sw.add_argument("name")

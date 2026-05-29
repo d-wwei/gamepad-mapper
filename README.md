@@ -8,8 +8,8 @@ recognizes.
 
 - Map buttons to keyboard shortcuts — including **left/right-specific** modifiers
   (`rctrl`, `rshift`, …) and **pure-modifier** chords, which AppleScript can't do
-- Left stick → mouse movement; stick presses (L3/R3) → mouse clicks
-- Right stick → arrow keys
+- Left stick → mouse movement; stick buttons can be mapped like any button
+- Right stick → arrow keys or page/list scrolling
 - **Hold-to-repeat** for any key (e.g. backspace)
 - Multiple **profiles** with **live hot-reload** — edit a profile, no restart
 - **`automap`**: auto-generate a layout for any SDL-known controller (no manual
@@ -19,15 +19,20 @@ recognizes.
 ## Requirements
 
 - macOS
-- Python 3.9+
+- Python 3.9–3.13 tested. Python 3.14 may need pygame wheels or local SDL
+  build headers before `pip install` can succeed.
 - A controller (USB or Bluetooth)
 
 ## Install
 
 ```sh
-python3 -m venv .venv
+python3.13 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
+
+If `python3.13` is not installed, use another supported Python 3.9–3.13
+interpreter. On newer Python versions, pygame may fall back to a source build
+and fail with a missing `SDL.h` unless SDL development headers are installed.
 
 ## Usage
 
@@ -66,9 +71,21 @@ bindings:
     repeat: true            # hold to repeat
   L3:
     action: mouse_click     # press left stick = left click
+  # Shell actions are disabled by default; prefer argv and opt in at runtime.
+  # ZR:
+  #   action: shell
+  #   argv: ["open", "-a", "Terminal"]
 sticks:
-  left:  {mode: mouse, speed: 900, deadzone: 0.15}
-  right: {mode: dpad, threshold: 0.6, repeat: 0.13}
+  left:  {mode: mouse, speed: 900, deadzone: 0.22, settle: 0.8, center_max: 0.35, recenter_after: 0.6}
+  right: {mode: scroll, speed: 900, deadzone_y: 0.10, deadzone_x: 0.16, settle: 0.8, center_max: 0.35, recenter_after: 0.6}
+dpad_modes:
+  toggle: [L, R]             # press together to switch physical D-pad mode
+  repeat: {delay: 0.35, interval: 0.08}
+  alternate:
+    dpad_up: shift+cmd+[
+    dpad_down: shift+cmd+]
+    dpad_left: ctrl+shift+tab
+    dpad_right: ctrl+tab
 ```
 
 Button names follow the labels printed on the pad (`A B X Y · L R · ZL ZR ·
@@ -83,3 +100,21 @@ are not meant to be hand-edited.
 - Quartz CGEvents: used only where AppleScript can't help — left/right-specific
   modifiers, pure-modifier chords, and `Escape` (which AppleScript delivers
   unreliably).
+
+## Safety and validation
+
+Profiles are validated before they become active. Unknown shortcut tokens are
+errors instead of being silently dropped, so `cmnd+q` will not degrade into a
+plain `q`. During `run`, a bad hot-reload keeps the last known good profile and
+prints the YAML or validation error.
+
+`{action: shell}` is skipped unless explicitly enabled:
+
+```sh
+./gamepad-mapper run --allow-shell-actions
+# or
+GAMEPAD_MAPPER_ALLOW_SHELL=1 ./gamepad-mapper run
+```
+
+Prefer `argv: [...]` for shell actions. Legacy `cmd: "..."` is split with
+shell-like quoting but is not executed through a shell.
